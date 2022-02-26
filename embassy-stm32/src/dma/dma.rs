@@ -42,7 +42,11 @@ pub(crate) unsafe fn on_irq() {
             foreach_dma_channel! {
                 ($channel_peri:ident, $dma, dma, $channel_num:expr, $index:expr, $dmamux:tt) => {
                     let cr = pac::$dma.st($channel_num).cr();
-                    if pac::$dma.isr($channel_num/4).read().tcif($channel_num%4) && cr.read().tcie() {
+                    let isr = pac::$dma.isr($channel_num/4).read();
+                    if isr.teif($channel_num%4) {
+                        panic!("DMA: error on DMA {} channel {}", dma_num!($dma), $channel_num);
+                    }
+                    if isr.tcif($channel_num%4) && cr.read().tcie() {
                         cr.write(|_| ()); // Disable channel interrupts with the default value.
                         STATE.ch_wakers[$index].wake();
                     }

@@ -1,3 +1,24 @@
+macro_rules! dma_num {
+    (DMA) => {
+        1
+    };
+    (DMA1) => {
+        1
+    };
+    (DMA2) => {
+        2
+    };
+    (BDMA) => {
+        1
+    };
+    (BDMA1) => {
+        1
+    };
+    (BDMA2) => {
+        2
+    };
+}
+
 #[cfg(bdma)]
 pub(crate) mod bdma;
 #[cfg(dma)]
