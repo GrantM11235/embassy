@@ -3,6 +3,7 @@
 use core::sync::atomic::{fence, Ordering};
 use core::task::Waker;
 
+use atomic_polyfill::AtomicU8;
 use embassy::interrupt::{Interrupt, InterruptExt};
 use embassy::waitqueue::AtomicWaker;
 
@@ -23,8 +24,75 @@ impl From<WordSize> for vals::Size {
     }
 }
 
+enum Half {
+    First,
+    Second,
+}
+
+const STATE_BITS_PER_CHANNEL: usize = 2;
+
+const STATE_BYTES: usize = ((BDMA_CHANNEL_COUNT * STATE_BITS_PER_CHANNEL) + 7) / 8;
+
+struct DmaState([AtomicU8; STATE_BYTES]);
+
+impl DmaState {
+    const fn new() -> Self {
+        const ZERO: AtomicU8 = AtomicU8::new(0);
+        Self([ZERO; STATE_BYTES])
+    }
+
+    fn get_byte(&self, index: u8) -> &AtomicU8 {
+        &self.0[index as usize / (8 / STATE_BITS_PER_CHANNEL)]
+    }
+
+    fn get_offset(index: u8) -> usize {
+        (index as usize * STATE_BITS_PER_CHANNEL) % 8
+    }
+
+    fn get(&self, index: u8) -> u8 {
+        // TODO: Relax ordering?
+        let byte = self.get_byte(index).load(Ordering::SeqCst);
+        let shifted = byte >> Self::get_offset(index);
+        shifted & 0b11
+    }
+
+    fn get_available_half(&self, index: u8) -> Option<Half> {
+        let state = self.get(index);
+        let first = state & 0b01 != 0;
+        let second = state & 0b10 != 0;
+
+        match (first, second) {
+            (false, false) => None,
+            (true, false) => Some(Half::First),
+            (false, true) => Some(Half::Second),
+            (true, true) => buffer_overrun(),
+        }
+    }
+
+    unsafe fn set_available_half(&self, index: u8, half: Half) {
+        let mut foo = match half {
+            Half::First => 0b01,
+            Half::Second => 0b10,
+        };
+        foo <<= Self::get_offset(index);
+        // TODO: Relax ordering?
+        self.get_byte(index).fetch_or(foo, Ordering::SeqCst);
+    }
+
+    unsafe fn mark_half_done(&self, index: u8, half: Half) {
+        let mut foo = match half {
+            Half::First => 0b01,
+            Half::Second => 0b10,
+        };
+        foo <<= Self::get_offset(index);
+        // TODO: Relax ordering?
+        self.get_byte(index).fetch_and(!foo, Ordering::SeqCst);
+    }
+}
+
 struct State {
     ch_wakers: [AtomicWaker; BDMA_CHANNEL_COUNT],
+    dma_state: DmaState,
 }
 
 impl State {
@@ -32,6 +100,7 @@ impl State {
         const AW: AtomicWaker = AtomicWaker::new();
         Self {
             ch_wakers: [AW; BDMA_CHANNEL_COUNT],
+            dma_state: DmaState::new(),
         }
     }
 }
@@ -64,13 +133,53 @@ unsafe fn handle_channel(
     isr_cached: regs::Isr,
 ) {
     let cr = dma.ch(channel_num as usize).cr();
+
     if isr_cached.teif(channel_num as usize) {
         panic!("BDMA: error on BDMA {} channel {}", dma_num, channel_num);
     }
-    if isr_cached.tcif(channel_num as usize) && cr.read().tcie() {
-        cr.write(|_| ()); // Disable channel interrupts with the default value.
-        STATE.ch_wakers[index as usize].wake();
+
+    let cr_cached = cr.read();
+
+    // The half transfer interrupt is enabled if and only if we are in circular mode
+    if cr_cached.htie() {
+        // Circular mode
+        match (
+            isr_cached.htif(channel_num as usize),
+            isr_cached.tcif(channel_num as usize),
+        ) {
+            (false, false) => {
+                // Neither half is done, do nothing
+            }
+            (true, false) => {
+                // First half is done
+                if STATE.dma_state.get_available_half(index).is_some() {
+                    buffer_overrun();
+                }
+                STATE.dma_state.set_available_half(index, Half::First);
+            }
+            (false, true) => {
+                // Second half is done
+                if STATE.dma_state.get_available_half(index).is_some() {
+                    buffer_overrun();
+                }
+                STATE.dma_state.set_available_half(index, Half::Second);
+            }
+            (true, true) => {
+                buffer_overrun();
+            }
+        }
+    } else {
+        // Regular mode
+        // TODO: Why do we need to check tcie?
+        if isr_cached.tcif(channel_num as usize) && cr_cached.tcie() {
+            cr.write(|_| ()); // Disable channel interrupts with the default value.
+            STATE.ch_wakers[index as usize].wake();
+        }
     }
+}
+
+fn buffer_overrun() -> ! {
+    panic!("Buffer overrun");
 }
 
 /// safety: must be called only once
@@ -103,6 +212,7 @@ foreach_dma_channel! {
                     len,
                     true,
                     vals::Size::from(W::bits()),
+                    false,
                     #[cfg(dmamux)]
                     <Self as super::dmamux::sealed::MuxChannel>::DMAMUX_REGS,
                     #[cfg(dmamux)]
@@ -124,6 +234,7 @@ foreach_dma_channel! {
                     count,
                     false,
                     vals::Size::from(W::bits()),
+                    false,
                     #[cfg(dmamux)]
                     <Self as super::dmamux::sealed::MuxChannel>::DMAMUX_REGS,
                     #[cfg(dmamux)]
@@ -144,6 +255,7 @@ foreach_dma_channel! {
                     len,
                     true,
                     vals::Size::from(W::bits()),
+                    false,
                     #[cfg(dmamux)]
                     <Self as super::dmamux::sealed::MuxChannel>::DMAMUX_REGS,
                     #[cfg(dmamux)]
@@ -184,6 +296,7 @@ mod low_level_api {
         mem_len: usize,
         incr_mem: bool,
         data_size: vals::Size,
+        circular: bool,
         #[cfg(dmamux)] dmamux_regs: pac::dmamux::Dmamux,
         #[cfg(dmamux)] dmamux_ch_num: u8,
     ) {
@@ -214,8 +327,14 @@ mod low_level_api {
             } else {
                 w.set_minc(vals::Inc::DISABLED);
             }
+            if circular {
+                w.set_circ(vals::Circ::ENABLED);
+            } else {
+                w.set_circ(vals::Circ::DISABLED);
+            }
             w.set_dir(dir);
             w.set_teie(true);
+            w.set_htie(circular);
             w.set_tcie(true);
             w.set_en(true);
         });
@@ -255,6 +374,7 @@ mod low_level_api {
     pub unsafe fn reset_status(dma: pac::bdma::Dma, channel_number: u8) {
         dma.ifcr().write(|w| {
             w.set_tcif(channel_number as _, true);
+            w.set_htif(channel_number as _, true);
             w.set_teif(channel_number as _, true);
         });
     }
