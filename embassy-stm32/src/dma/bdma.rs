@@ -9,7 +9,7 @@ use embassy::waitqueue::AtomicWaker;
 use crate::dma::Request;
 use crate::generated::BDMA_CHANNEL_COUNT;
 use crate::pac;
-use crate::pac::bdma::vals;
+use crate::pac::bdma::{regs, vals};
 
 use super::{Word, WordSize};
 
@@ -39,25 +39,37 @@ impl State {
 static STATE: State = State::new();
 
 pub(crate) unsafe fn on_irq() {
+    // TODO: clean up this interrupt handler so that it doesn't check every single channel
     foreach_peripheral! {
         (bdma, BDMA1) => {
             // BDMA1 in H7 doesn't use DMAMUX, which breaks
         };
         (bdma, $dma:ident) => {
-            let isr = pac::$dma.isr().read();
+            use pac::$dma;
+            let isr_cached = pac::$dma.isr().read();
             foreach_dma_channel! {
                 ($channel_peri:ident, $dma, bdma, $channel_num:expr, $index:expr, $dmamux:tt) => {
-                    let cr = pac::$dma.ch($channel_num).cr();
-                    if isr.teif($channel_num) {
-                        panic!("BDMA: error on BDMA {} channel {}", dma_num!($dma), $channel_num);
-                    }
-                    if isr.tcif($channel_num) && cr.read().tcie() {
-                        cr.write(|_| ()); // Disable channel interrupts with the default value.
-                        STATE.ch_wakers[$index].wake();
-                    }
+                    handle_channel($dma, dma_num!($dma), $channel_num, $index, isr_cached);
                 };
             }
         };
+    }
+}
+
+unsafe fn handle_channel(
+    dma: pac::bdma::Dma,
+    dma_num: u8,
+    channel_num: u8,
+    index: u8,
+    isr_cached: regs::Isr,
+) {
+    let cr = dma.ch(channel_num as usize).cr();
+    if isr_cached.teif(channel_num as usize) {
+        panic!("BDMA: error on BDMA {} channel {}", dma_num, channel_num);
+    }
+    if isr_cached.tcif(channel_num as usize) && cr.read().tcie() {
+        cr.write(|_| ()); // Disable channel interrupts with the default value.
+        STATE.ch_wakers[index as usize].wake();
     }
 }
 
