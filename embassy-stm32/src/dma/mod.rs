@@ -29,6 +29,7 @@ mod dmamux;
 #[cfg(dmamux)]
 pub use dmamux::*;
 
+use atomic_polyfill::{AtomicU8, Ordering};
 use core::future::Future;
 use core::marker::PhantomData;
 use core::mem;
@@ -49,6 +50,70 @@ pub(crate) use transfers::*;
 pub type Request = u8;
 #[cfg(not(any(bdma_v2, dma_v2, dmamux)))]
 pub type Request = ();
+
+pub enum Half {
+    First,
+    Second,
+}
+
+const STATE_BITS_PER_CHANNEL: usize = 2;
+
+struct DmaState<const N: usize>([AtomicU8; N]);
+
+impl<const N: usize> DmaState<N> {
+    const fn new() -> Self {
+        const ZERO: AtomicU8 = AtomicU8::new(0);
+        Self([ZERO; N])
+    }
+
+    fn get_byte(&self, index: u8) -> &AtomicU8 {
+        &self.0[index as usize / (8 / STATE_BITS_PER_CHANNEL)]
+    }
+
+    fn get_offset(index: u8) -> usize {
+        (index as usize * STATE_BITS_PER_CHANNEL) % 8
+    }
+
+    fn get(&self, index: u8) -> u8 {
+        // TODO: Relax ordering?
+        let byte = self.get_byte(index).load(Ordering::SeqCst);
+        let shifted = byte >> Self::get_offset(index);
+        shifted & 0b11
+    }
+
+    fn get_available_half(&self, index: u8) -> Option<Half> {
+        let state = self.get(index);
+        let first = state & 0b01 != 0;
+        let second = state & 0b10 != 0;
+
+        match (first, second) {
+            (false, false) => None,
+            (true, false) => Some(Half::First),
+            (false, true) => Some(Half::Second),
+            (true, true) => panic!("Buffer overrun"),
+        }
+    }
+
+    unsafe fn set_available_half(&self, index: u8, half: Half) {
+        let mut foo = match half {
+            Half::First => 0b01,
+            Half::Second => 0b10,
+        };
+        foo <<= Self::get_offset(index);
+        // TODO: Relax ordering?
+        self.get_byte(index).fetch_or(foo, Ordering::SeqCst);
+    }
+
+    unsafe fn mark_half_done(&self, index: u8, half: Half) {
+        let mut foo = match half {
+            Half::First => 0b01,
+            Half::Second => 0b10,
+        };
+        foo <<= Self::get_offset(index);
+        // TODO: Relax ordering?
+        self.get_byte(index).fetch_and(!foo, Ordering::SeqCst);
+    }
+}
 
 pub(crate) mod sealed {
     use super::*;
@@ -93,6 +158,24 @@ pub(crate) mod sealed {
             reg_addr: *const W,
             buf: *mut [W],
         );
+
+        unsafe fn start_circ_read<W: super::Word, const N: usize>(
+            &mut self,
+            request: Request,
+            reg_addr: *const W,
+            buf: *mut [[W; N]; 2],
+        );
+
+        unsafe fn start_circ_write<W: super::Word, const N: usize>(
+            &mut self,
+            request: Request,
+            reg_addr: *mut W,
+            buf: *const [[W; N]; 2],
+        );
+
+        fn get_available_half(&self) -> Option<Half>;
+
+        unsafe fn mark_half_done(&self, half: Half);
 
         /// Requests the channel to stop.
         /// NOTE: The channel does not immediately stop, you have to wait
@@ -143,6 +226,8 @@ impl Word for u32 {
 }
 
 mod transfers {
+    use core::ops::ControlFlow;
+
     use super::*;
 
     #[allow(unused)]
@@ -158,6 +243,22 @@ mod transfers {
         unsafe { channel.start_read::<W>(request, reg_addr, buf) };
 
         Transfer::new(channel)
+    }
+
+    #[allow(unused)]
+    pub fn circ_read<'a, W: Word, R: 'a, const N: usize>(
+        channel: impl Unborrow<Target = impl Channel> + 'a,
+        request: Request,
+        reg_addr: *mut W,
+        buffer: &'a mut [[W; N]; 2],
+        closure: impl FnMut(&mut [W; N]) -> ControlFlow<R> + 'a,
+    ) -> impl Future<Output = R> + 'a {
+        assert!(N > 0 && 2 * N <= 0xFFFF);
+        unborrow!(channel);
+
+        unsafe { channel.start_circ_read(request, reg_addr, buffer) };
+
+        CircTransfer::new(channel, buffer, closure)
     }
 
     #[allow(unused)]
@@ -188,6 +289,22 @@ mod transfers {
         unsafe { channel.start_write_repeated::<W>(request, repeated, count, reg_addr) };
 
         Transfer::new(channel)
+    }
+
+    #[allow(unused)]
+    pub fn circ_write<'a, W: Word, R: 'a, const N: usize>(
+        channel: impl Unborrow<Target = impl Channel> + 'a,
+        request: Request,
+        reg_addr: *mut W,
+        buffer: &'a mut [[W; N]; 2],
+        closure: impl FnMut(&mut [W; N]) -> ControlFlow<R> + 'a,
+    ) -> impl Future<Output = R> + 'a {
+        assert!(N > 0 && 2 * N <= 0xFFFF);
+        unborrow!(channel);
+
+        unsafe { channel.start_circ_write(request, reg_addr, buffer) };
+
+        CircTransfer::new(channel, buffer, closure)
     }
 
     pub(crate) struct Transfer<'a, C: Channel> {
@@ -221,6 +338,89 @@ mod transfers {
                 Poll::Pending
             } else {
                 Poll::Ready(())
+            }
+        }
+    }
+
+    #[pin_project::pin_project(PinnedDrop)]
+    pub(crate) struct CircTransfer<'a, C, W, F, R, const N: usize>
+    where
+        C: Channel,
+        F: FnMut(&mut [W; N]) -> ControlFlow<R>,
+    {
+        channel: C,
+        buffer: *mut [[W; N]; 2],
+        closure: F,
+        _phantom: PhantomData<&'a mut C>,
+    }
+
+    impl<'a, C, W, F, R, const N: usize> CircTransfer<'a, C, W, F, R, N>
+    where
+        C: Channel,
+        F: FnMut(&mut [W; N]) -> ControlFlow<R>,
+    {
+        pub(crate) fn new(
+            channel: impl Unborrow<Target = C> + 'a,
+            buffer: *mut [[W; N]; 2],
+            closure: F,
+        ) -> Self {
+            unborrow!(channel);
+            Self {
+                channel,
+                buffer,
+                closure,
+                _phantom: PhantomData,
+            }
+        }
+    }
+
+    #[pin_project::pinned_drop]
+    impl<'a, C, W, F, R, const N: usize> PinnedDrop for CircTransfer<'a, C, W, F, R, N>
+    where
+        C: Channel,
+        F: FnMut(&mut [W; N]) -> ControlFlow<R>,
+    {
+        fn drop(self: Pin<&mut Self>) {
+            let this = self.project();
+            this.channel.request_stop();
+            while this.channel.is_running() {}
+        }
+    }
+
+    impl<'a, C, W, F, R, const N: usize> Future for CircTransfer<'a, C, W, F, R, N>
+    where
+        C: Channel,
+        F: FnMut(&mut [W; N]) -> ControlFlow<R>,
+    {
+        type Output = R;
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.channel.set_waker(cx.waker());
+            match self.channel.get_available_half() {
+                Some(half) => {
+                    let ptr = match half {
+                        Half::First => self.buffer as *mut [W; N],
+                        Half::Second => unsafe { (self.buffer as *mut [W; N]).add(N) },
+                    };
+
+                    let buf: &mut [W; N] = unsafe { &mut *ptr };
+                    let res = (self.closure)(buf);
+
+                    drop(buf);
+
+                    unsafe {
+                        self.channel.mark_half_done(half);
+                    }
+
+                    match res {
+                        ControlFlow::Continue(()) => Poll::Pending,
+                        ControlFlow::Break(res) => {
+                            self.channel.request_stop();
+                            while self.channel.is_running() {}
+                            Poll::Ready(res)
+                        }
+                    }
+                }
+                None => Poll::Pending,
             }
         }
     }
