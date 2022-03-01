@@ -156,6 +156,7 @@ unsafe fn handle_channel(
                     buffer_overrun();
                 }
                 STATE.dma_state.set_available_half(index, Half::First);
+                STATE.ch_wakers[index as usize].wake();
             }
             (false, true) => {
                 // Second half is done
@@ -163,6 +164,7 @@ unsafe fn handle_channel(
                     buffer_overrun();
                 }
                 STATE.dma_state.set_available_half(index, Half::Second);
+                STATE.ch_wakers[index as usize].wake();
             }
             (true, true) => {
                 buffer_overrun();
@@ -284,6 +286,9 @@ foreach_dma_channel! {
 }
 
 mod low_level_api {
+    use core::marker::PhantomData;
+    use core::ops::ControlFlow;
+
     use super::*;
 
     pub unsafe fn start_transfer(
@@ -377,5 +382,75 @@ mod low_level_api {
             w.set_htif(channel_number as _, true);
             w.set_teif(channel_number as _, true);
         });
+    }
+
+    fn get_index(dma: pac::bdma::Dma, ch: u8) -> u8 {
+        todo!()
+    }
+
+    struct CircTransfer<'b, T: Word, const N: usize> {
+        dma: pac::bdma::Dma,
+        channel_number: u8,
+        buf: *mut [[T; N]; 2],
+        phantom: PhantomData<&'b mut T>,
+    }
+
+    impl<'b, T: Word, const N: usize> CircTransfer<'b, T, N> {
+        fn new(
+            dma: pac::bdma::Dma,
+            channel_number: u8,
+            #[cfg(any(bdma_v2, dmamux))] request: Request,
+            peri_addr: *const T,
+            buf: *mut [[T; N]; 2],
+            data_size: vals::Size,
+            #[cfg(dmamux)] dmamux_regs: pac::dmamux::Dmamux,
+            #[cfg(dmamux)] dmamux_ch_num: u8,
+        ) -> Self {
+            unsafe {
+                start_transfer(
+                    dma,
+                    channel_number,
+                    #[cfg(any(bdma_v2, dmamux))]
+                    request,
+                    vals::Dir::FROMPERIPHERAL,
+                    peri_addr as *const u32,
+                    buf as *mut u32,
+                    N,
+                    true,
+                    data_size,
+                    true,
+                    #[cfg(dmamux)]
+                    dmamux_regs,
+                    #[cfg(dmamux)]
+                    dmamux_ch_num,
+                )
+            }
+
+            Self {
+                dma,
+                channel_number,
+                buf,
+                phantom: PhantomData,
+            }
+        }
+
+        fn try_process<R>(&mut self, f: impl FnOnce(&[T; N]) -> R) -> Option<R> {
+            let index = get_index(self.dma, self.channel_number);
+            let half = STATE.dma_state.get_available_half(index)?;
+
+            let ptr = match half {
+                Half::First => self.buf as *mut [T; N],
+                Half::Second => unsafe { (self.buf as *mut [T; N]).add(N) },
+            };
+
+            let buf: &[T; N] = unsafe { &*ptr };
+            let res = f(buf);
+
+            unsafe { STATE.dma_state.mark_half_done(index, half) }
+
+            Some(res)
+        }
+
+        async fn process<R>(&mut self, f: impl FnMut(&[T; N]) -> ControlFlow<R>) -> R {}
     }
 }
