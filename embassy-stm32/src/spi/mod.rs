@@ -95,13 +95,13 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
         into_ref!(peri, sck, mosi, miso);
         unsafe {
             sck.set_as_af(sck.af_num(), AFType::OutputPushPull);
-            #[cfg(any(spi_v2, spi_v3, spi_v4))]
+            #[cfg(any(spi_v1, spi_v2, spi_v3, spi_v4))]
             sck.set_speed(crate::gpio::Speed::VeryHigh);
             mosi.set_as_af(mosi.af_num(), AFType::OutputPushPull);
-            #[cfg(any(spi_v2, spi_v3, spi_v4))]
+            #[cfg(any(spi_v1, spi_v2, spi_v3, spi_v4))]
             mosi.set_speed(crate::gpio::Speed::VeryHigh);
             miso.set_as_af(miso.af_num(), AFType::Input);
-            #[cfg(any(spi_v2, spi_v3, spi_v4))]
+            #[cfg(any(spi_v1, spi_v2, spi_v3, spi_v4))]
             miso.set_speed(crate::gpio::Speed::VeryHigh);
         }
 
@@ -129,10 +129,10 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
         into_ref!(sck, miso);
         unsafe {
             sck.set_as_af(sck.af_num(), AFType::OutputPushPull);
-            #[cfg(any(spi_v2, spi_v3, spi_v4))]
+            #[cfg(any(spi_v1, spi_v2, spi_v3, spi_v4))]
             sck.set_speed(crate::gpio::Speed::VeryHigh);
             miso.set_as_af(miso.af_num(), AFType::Input);
-            #[cfg(any(spi_v2, spi_v3, spi_v4))]
+            #[cfg(any(spi_v1, spi_v2, spi_v3, spi_v4))]
             miso.set_speed(crate::gpio::Speed::VeryHigh);
         }
 
@@ -160,10 +160,10 @@ impl<'d, T: Instance, Tx, Rx> Spi<'d, T, Tx, Rx> {
         into_ref!(sck, mosi);
         unsafe {
             sck.set_as_af(sck.af_num(), AFType::OutputPushPull);
-            #[cfg(any(spi_v2, spi_v3, spi_v4))]
+            #[cfg(any(spi_v1, spi_v2, spi_v3, spi_v4))]
             sck.set_speed(crate::gpio::Speed::VeryHigh);
             mosi.set_as_af(mosi.af_num(), AFType::OutputPushPull);
-            #[cfg(any(spi_v2, spi_v3, spi_v4))]
+            #[cfg(any(spi_v1, spi_v2, spi_v3, spi_v4))]
             mosi.set_speed(crate::gpio::Speed::VeryHigh);
         }
 
