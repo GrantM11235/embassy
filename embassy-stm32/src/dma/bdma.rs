@@ -1,10 +1,12 @@
 #![macro_use]
 
-use core::future::Future;
+use core::future::{poll_fn, Future};
+use core::ops::ControlFlow;
 use core::pin::Pin;
 use core::sync::atomic::{fence, Ordering};
 use core::task::{Context, Poll};
 
+use atomic_polyfill::AtomicU8;
 use embassy_cortex_m::interrupt::Priority;
 use embassy_hal_common::{into_ref, Peripheral, PeripheralRef};
 use embassy_sync::waitqueue::AtomicWaker;
@@ -48,13 +50,16 @@ impl From<Dir> for vals::Dir {
 
 struct State {
     ch_wakers: [AtomicWaker; BDMA_CHANNEL_COUNT],
+    foo: [AtomicU8; BDMA_CHANNEL_COUNT],
 }
 
 impl State {
     const fn new() -> Self {
         const AW: AtomicWaker = AtomicWaker::new();
+        const FOO: AtomicU8 = AtomicU8::new(0);
         Self {
             ch_wakers: [AW; BDMA_CHANNEL_COUNT],
+            foo: [FOO; BDMA_CHANNEL_COUNT],
         }
     }
 }
@@ -105,7 +110,19 @@ pub(crate) unsafe fn on_irq_inner(dma: pac::bdma::Dma, channel_num: usize, index
     if isr.teif(channel_num) {
         panic!("DMA: error on BDMA@{:08x} channel {}", dma.0 as u32, channel_num);
     }
-    if isr.tcif(channel_num) && cr.read().tcie() {
+    if cr.read().htie() {
+        // Circular mode
+        let first = isr.htif(channel_num);
+        let second = isr.tcif(channel_num);
+        if first || second {
+            STATE.foo[index].fetch_or(first as u8 | ((second as u8) << 1), Ordering::SeqCst);
+            dma.ifcr().write(|reg| {
+                reg.set_htif(channel_num, first);
+                reg.set_tcif(channel_num, second);
+            });
+            STATE.ch_wakers[index].wake();
+        }
+    } else if isr.tcif(channel_num) && cr.read().tcie() {
         cr.write(|_| ()); // Disable channel interrupts with the default value.
         STATE.ch_wakers[index].wake();
     }
@@ -339,6 +356,124 @@ impl<'a, C: Channel> Future for Transfer<'a, C> {
             Poll::Pending
         } else {
             Poll::Ready(())
+        }
+    }
+}
+
+pub struct CircRead<'a, C: Channel, W: Word, const N: usize> {
+    channel: PeripheralRef<'a, C>,
+    buffer: *mut [[W; N]; 2],
+}
+
+enum Half {
+    First,
+    Second,
+}
+
+impl<'a, C: Channel, W: Word, const N: usize> CircRead<'a, C, W, N> {
+    pub unsafe fn new(channel: impl Peripheral<P = C> + 'a, peri_addr: *mut W, buffer: &'a mut [[W; N]; 2]) -> Self {
+        into_ref!(channel);
+
+        let data_size = W::size();
+
+        let ch = channel.regs().ch(channel.num());
+
+        // "Preceding reads and writes cannot be moved past subsequent writes."
+        fence(Ordering::SeqCst);
+
+        // #[cfg(bdma_v2)]
+        // critical_section::with(|_| channel.regs().cselr().modify(|w| w.set_cs(channel.num(), _request)));
+
+        let mut this = Self { channel, buffer };
+        this.clear_irqs();
+
+        // #[cfg(dmamux)]
+        // super::dmamux::configure_dmamux(&mut *this.channel, _request);
+
+        unsafe {
+            ch.par().write_value(peri_addr as u32);
+            ch.mar().write_value(this.buffer as u32);
+            ch.ndtr().write(|w| w.set_ndt(N as u16 * 2));
+            ch.cr().write(|w| {
+                w.set_psize(data_size.into());
+                w.set_msize(data_size.into());
+                w.set_minc(vals::Inc::ENABLED);
+                w.set_circ(vals::Circ::ENABLED);
+                w.set_dir(Dir::PeripheralToMemory.into());
+                w.set_teie(true);
+                w.set_htie(true);
+                w.set_tcie(true);
+                w.set_en(true);
+            });
+        }
+
+        this
+    }
+
+    fn clear_irqs(&mut self) {
+        unsafe {
+            self.channel.regs().ifcr().write(|w| {
+                w.set_tcif(self.channel.num(), true);
+                w.set_teif(self.channel.num(), true);
+            })
+        }
+    }
+
+    async fn wait(&self) -> Half {
+        poll_fn(|cx| {
+            let foo = STATE.foo[self.channel.index()].load(Ordering::SeqCst);
+
+            match foo {
+                0 => {
+                    STATE.ch_wakers[self.channel.index()].register(cx.waker());
+                    Poll::Pending
+                }
+                1 => Poll::Ready(Half::First),
+                2 => Poll::Ready(Half::Second),
+                _ => panic!("Overrun"),
+            }
+        })
+        .await
+    }
+
+    fn mark_half_done(&self, half: Half) {
+        let mask = match half {
+            Half::First => 1,
+            Half::Second => 2,
+        };
+
+        let prev = STATE.foo[self.channel.index()].fetch_and(!mask, Ordering::SeqCst);
+
+        if prev != mask {
+            panic!("Overrun");
+        }
+    }
+
+    async fn do_once<R>(&mut self, f: impl FnOnce(*mut [W; N]) -> R) -> R {
+        let half = self.wait().await;
+
+        let ptr = self.buffer;
+        let ptr = ptr as *mut [W; N];
+        let ptr = match half {
+            Half::First => ptr,
+            Half::Second => unsafe { ptr.add(1) },
+        };
+
+        let res = f(ptr);
+
+        self.mark_half_done(half);
+
+        res
+    }
+
+    pub async fn do_while<R>(&mut self, mut f: impl FnMut(*mut [W; N]) -> ControlFlow<R>) -> R {
+        loop {
+            let res = self.do_once(&mut f).await;
+
+            if let ControlFlow::Break(res) = res {
+                unsafe { self.channel.regs().ch(self.channel.num()).cr().write(|_| {}) }; // Disable channel interrupts with the default value.
+                return res;
+            }
         }
     }
 }

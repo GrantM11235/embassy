@@ -4,7 +4,7 @@ use embedded_hal_02::blocking::delay::DelayUs;
 use crate::adc::{Adc, AdcPin, Instance, SampleTime};
 use crate::rcc::get_freqs;
 use crate::time::Hertz;
-use crate::Peripheral;
+use crate::{dma, Peripheral};
 
 pub const VDDA_CALIB_MV: u32 = 3300;
 pub const ADC_MAX: u32 = (1 << 12) - 1;
@@ -145,5 +145,66 @@ impl<'d, T: Instance> Adc<'d, T> {
         } else {
             T::regs().smpr1().modify(|reg| reg.set_smp((ch - 10) as _, sample_time));
         }
+    }
+
+    fn regs(&self) -> crate::pac::adc::Adc {
+        T::regs()
+    }
+}
+
+use crate::peripherals::{ADC1, DMA1_CH1};
+
+impl<'d> Adc<'d, ADC1> {
+    pub fn dma_read<'a>(
+        &'a mut self,
+        pin: &'a mut impl AdcPin<ADC1>,
+        buffer: &'a mut [u16],
+        dma: &'a mut DMA1_CH1,
+    ) -> dma::Transfer<'a, DMA1_CH1> {
+        unsafe {
+            self.regs().cr1().modify(|reg| reg.set_discen(false));
+            Self::set_channel_sample_time(pin.channel(), self.sample_time);
+            self.regs().sqr3().write(|reg| reg.set_sq(0, pin.channel()));
+            self.regs().cr2().modify(|reg| reg.set_dma(true));
+        }
+
+        let transfer = unsafe {
+            let peri_addr = self.regs().dr().ptr() as *mut u16;
+            dma::Transfer::new_read(dma, (), peri_addr, buffer, Default::default())
+        };
+
+        unsafe {
+            self.regs().cr2().modify(|reg| reg.set_cont(true));
+            self.regs().cr2().modify(|reg| reg.set_adon(true));
+        }
+
+        transfer
+    }
+
+    pub async fn circ_dma_read<'a, R, const N: usize>(
+        &'a mut self,
+        pin: &'a mut impl AdcPin<ADC1>,
+        buffer: &'a mut [[u16; N]; 2],
+        dma: &'a mut DMA1_CH1,
+        f: impl FnMut(*mut [u16; N]) -> core::ops::ControlFlow<R>,
+    ) -> R {
+        unsafe {
+            self.regs().cr1().modify(|reg| reg.set_discen(false));
+            Self::set_channel_sample_time(pin.channel(), self.sample_time);
+            self.regs().sqr3().write(|reg| reg.set_sq(0, pin.channel()));
+            self.regs().cr2().modify(|reg| reg.set_dma(true));
+        }
+
+        let mut transfer = unsafe {
+            let peri_addr = self.regs().dr().ptr() as *mut u16;
+            dma::CircRead::new(dma, peri_addr, buffer)
+        };
+
+        unsafe {
+            self.regs().cr2().modify(|reg| reg.set_cont(true));
+            self.regs().cr2().modify(|reg| reg.set_adon(true));
+        }
+
+        transfer.do_while(f).await
     }
 }
