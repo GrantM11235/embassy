@@ -181,13 +181,13 @@ impl<'d> Adc<'d, ADC1> {
         transfer
     }
 
-    pub async fn circ_dma_read<'a, R, const N: usize>(
+    pub async fn circ_dma_read<'a, const N: usize>(
         &'a mut self,
         pin: &'a mut impl AdcPin<ADC1>,
         buffer: &'a mut [[u16; N]; 2],
         dma: &'a mut DMA1_CH1,
-        f: impl FnMut(*mut [u16; N]) -> core::ops::ControlFlow<R>,
-    ) -> R {
+        f: impl FnMut(crate::dma::bdma::SendPtr<[u16; N]>) -> core::ops::ControlFlow<()> + Send,
+    ) {
         unsafe {
             self.regs().cr1().modify(|reg| reg.set_discen(false));
             Self::set_channel_sample_time(pin.channel(), self.sample_time);
@@ -195,7 +195,7 @@ impl<'d> Adc<'d, ADC1> {
             self.regs().cr2().modify(|reg| reg.set_dma(true));
         }
 
-        let mut transfer = unsafe {
+        let transfer = unsafe {
             let peri_addr = self.regs().dr().ptr() as *mut u16;
             dma::CircRead::new(dma, peri_addr, buffer)
         };

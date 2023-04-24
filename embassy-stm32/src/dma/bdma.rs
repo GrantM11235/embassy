@@ -3,10 +3,11 @@
 use core::future::{poll_fn, Future};
 use core::ops::ControlFlow;
 use core::pin::Pin;
+use core::ptr;
 use core::sync::atomic::{fence, Ordering};
 use core::task::{Context, Poll};
 
-use atomic_polyfill::AtomicU8;
+use atomic_polyfill::AtomicPtr;
 use embassy_cortex_m::interrupt::Priority;
 use embassy_hal_common::{into_ref, Peripheral, PeripheralRef};
 use embassy_sync::waitqueue::AtomicWaker;
@@ -50,13 +51,13 @@ impl From<Dir> for vals::Dir {
 
 struct State {
     ch_wakers: [AtomicWaker; BDMA_CHANNEL_COUNT],
-    foo: [AtomicU8; BDMA_CHANNEL_COUNT],
+    foo: [AtomicPtr<*mut (dyn FnMut(Half) -> ControlFlow<()> + Send)>; BDMA_CHANNEL_COUNT],
 }
 
 impl State {
     const fn new() -> Self {
         const AW: AtomicWaker = AtomicWaker::new();
-        const FOO: AtomicU8 = AtomicU8::new(0);
+        const FOO: AtomicPtr<*mut (dyn FnMut(Half) -> ControlFlow<()> + Send)> = AtomicPtr::new(ptr::null_mut());
         Self {
             ch_wakers: [AW; BDMA_CHANNEL_COUNT],
             foo: [FOO; BDMA_CHANNEL_COUNT],
@@ -114,12 +115,46 @@ pub(crate) unsafe fn on_irq_inner(dma: pac::bdma::Dma, channel_num: usize, index
         // Circular mode
         let first = isr.htif(channel_num);
         let second = isr.tcif(channel_num);
-        if first || second {
-            STATE.foo[index].fetch_or(first as u8 | ((second as u8) << 1), Ordering::SeqCst);
-            dma.ifcr().write(|reg| {
-                reg.set_htif(channel_num, first);
-                reg.set_tcif(channel_num, second);
-            });
+
+        let half = match (first, second) {
+            (true, true) => panic!("Overrun before closure"),
+            (true, false) => {
+                dma.ifcr().write(|reg| {
+                    reg.set_htif(channel_num, true);
+                });
+                Half::First
+            }
+            (false, true) => {
+                dma.ifcr().write(|reg| {
+                    reg.set_tcif(channel_num, true);
+                });
+                Half::Second
+            }
+            (false, false) => return,
+        };
+
+        let foo = STATE.foo[index].load(Ordering::SeqCst);
+        if foo.is_null() {
+            return;
+        }
+
+        let foo = *foo;
+        let foo = &mut *foo;
+
+        let res = foo(half);
+
+        let isr_again = dma.isr().read();
+        let overflowed = match half {
+            Half::First => isr_again.tcif(channel_num),
+            Half::Second => isr_again.htif(channel_num),
+        };
+        if overflowed {
+            panic!("Overflow after closure");
+        }
+
+        if res.is_break() {
+            cr.write(|_| ()); // Disable channel interrupts with the default value.
+            STATE.foo[index].store(ptr::null_mut(), Ordering::SeqCst);
             STATE.ch_wakers[index].wake();
         }
     } else if isr.tcif(channel_num) && cr.read().tcie() {
@@ -365,6 +400,7 @@ pub struct CircRead<'a, C: Channel, W: Word, const N: usize> {
     buffer: *mut [[W; N]; 2],
 }
 
+#[derive(Clone, Copy)]
 enum Half {
     First,
     Second,
@@ -384,15 +420,17 @@ impl<'a, C: Channel, W: Word, const N: usize> CircRead<'a, C, W, N> {
         // #[cfg(bdma_v2)]
         // critical_section::with(|_| channel.regs().cselr().modify(|w| w.set_cs(channel.num(), _request)));
 
-        let mut this = Self { channel, buffer };
-        this.clear_irqs();
+        // clear irqs
+        channel.regs().ifcr().write(|w| {
+            w.set_gif(channel.num(), true);
+        });
 
         // #[cfg(dmamux)]
         // super::dmamux::configure_dmamux(&mut *this.channel, _request);
 
         unsafe {
             ch.par().write_value(peri_addr as u32);
-            ch.mar().write_value(this.buffer as u32);
+            ch.mar().write_value(buffer as *mut _ as u32);
             ch.ndtr().write(|w| w.set_ndt(N as u16 * 2));
             ch.cr().write(|w| {
                 w.set_psize(data_size.into());
@@ -407,73 +445,101 @@ impl<'a, C: Channel, W: Word, const N: usize> CircRead<'a, C, W, N> {
             });
         }
 
-        this
+        Self { channel, buffer }
     }
 
-    fn clear_irqs(&mut self) {
-        unsafe {
-            self.channel.regs().ifcr().write(|w| {
-                w.set_tcif(self.channel.num(), true);
-                w.set_teif(self.channel.num(), true);
-            })
+    // async fn wait(&self) -> Half {
+    //     poll_fn(|cx| {
+    //         let foo = STATE.foo[self.channel.index()].load(Ordering::SeqCst);
+
+    //         match foo {
+    //             0 => {
+    //                 STATE.ch_wakers[self.channel.index()].register(cx.waker());
+    //                 Poll::Pending
+    //             }
+    //             1 => Poll::Ready(Half::First),
+    //             2 => Poll::Ready(Half::Second),
+    //             _ => panic!("Overrun"),
+    //         }
+    //     })
+    //     .await
+    // }
+
+    // async fn do_once<R>(&mut self, f: impl FnOnce(*mut [W; N]) -> R) -> R {
+    //     let half = self.wait().await;
+
+    //     let ptr = self.buffer;
+    //     let ptr = ptr as *mut [W; N];
+    //     let ptr = match half {
+    //         Half::First => ptr,
+    //         Half::Second => unsafe { ptr.add(1) },
+    //     };
+
+    //     let res = f(ptr);
+
+    //     self.mark_half_done(half);
+
+    //     res
+    // }
+
+    pub async fn do_while(self, mut f: impl FnMut(SendPtr<[W; N]>) -> ControlFlow<()> + Send + 'a) {
+        let buffer = SendPtr(self.buffer);
+
+        fn pick_half<T>(buffer: SendPtr<[T; 2]>, half: Half) -> SendPtr<T> {
+            let ptr = buffer.0;
+            let ptr = ptr as *mut T;
+            let ptr = match half {
+                Half::First => ptr,
+                Half::Second => unsafe { ptr.add(1) },
+            };
+            SendPtr(ptr)
         }
-    }
 
-    async fn wait(&self) -> Half {
+        // unsafe fn extend_lifetime<'b>(
+        //     f: impl FnMut(SendPtr<[W; N]>) -> ControlFlow<()> + Send + 'b,
+        // ) -> impl FnMut(SendPtr<[W; N]>) -> ControlFlow<()> + Send + 'static {
+        //     core::mem::transmute(f)
+        // }
+
+        let mut closure = move |half| {
+            // let ptr = buffer.0;
+            // let ptr = ptr as *mut [W; N];
+            // let ptr = match half {
+            //     Half::First => ptr,
+            //     Half::Second => unsafe { ptr.add(1) },
+            // };
+            f(pick_half(buffer, half))
+        };
+        let dyn_closure: *mut (dyn FnMut(Half) -> ControlFlow<()> + Send + 'a) = &mut closure;
+        let mut dyn_closure: *mut (dyn FnMut(Half) -> ControlFlow<()> + Send + 'static) =
+            unsafe { core::mem::transmute(dyn_closure) };
+        let dyn_closure_ptr = &mut dyn_closure;
+
+        STATE.foo[self.channel.index()].store(dyn_closure_ptr, Ordering::SeqCst);
+
         poll_fn(|cx| {
-            let foo = STATE.foo[self.channel.index()].load(Ordering::SeqCst);
-
-            match foo {
-                0 => {
-                    STATE.ch_wakers[self.channel.index()].register(cx.waker());
-                    Poll::Pending
-                }
-                1 => Poll::Ready(Half::First),
-                2 => Poll::Ready(Half::Second),
-                _ => panic!("Overrun"),
+            let ptr = STATE.foo[self.channel.index()].load(Ordering::SeqCst);
+            if ptr.is_null() {
+                Poll::Ready(())
+            } else {
+                STATE.ch_wakers[self.channel.index()].register(cx.waker());
+                Poll::Pending
             }
         })
-        .await
-    }
+        .await;
 
-    fn mark_half_done(&self, half: Half) {
-        let mask = match half {
-            Half::First => 1,
-            Half::Second => 2,
-        };
+        // loop {
+        //     let res = self.do_once(&mut f).await;
 
-        let prev = STATE.foo[self.channel.index()].fetch_and(!mask, Ordering::SeqCst);
-
-        if prev != mask {
-            panic!("Overrun");
-        }
-    }
-
-    async fn do_once<R>(&mut self, f: impl FnOnce(*mut [W; N]) -> R) -> R {
-        let half = self.wait().await;
-
-        let ptr = self.buffer;
-        let ptr = ptr as *mut [W; N];
-        let ptr = match half {
-            Half::First => ptr,
-            Half::Second => unsafe { ptr.add(1) },
-        };
-
-        let res = f(ptr);
-
-        self.mark_half_done(half);
-
-        res
-    }
-
-    pub async fn do_while<R>(&mut self, mut f: impl FnMut(*mut [W; N]) -> ControlFlow<R>) -> R {
-        loop {
-            let res = self.do_once(&mut f).await;
-
-            if let ControlFlow::Break(res) = res {
-                unsafe { self.channel.regs().ch(self.channel.num()).cr().write(|_| {}) }; // Disable channel interrupts with the default value.
-                return res;
-            }
-        }
+        //     if let ControlFlow::Break(res) = res {
+        //         unsafe { self.channel.regs().ch(self.channel.num()).cr().write(|_| {}) }; // Disable channel interrupts with the default value.
+        //         return res;
+        //     }
+        // }
     }
 }
+
+#[derive(Clone, Copy)]
+pub struct SendPtr<T>(pub *mut T);
+unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T> Sync for SendPtr<T> {}
