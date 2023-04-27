@@ -1,7 +1,7 @@
 #![macro_use]
 
 use core::cell::UnsafeCell;
-use core::future::Future;
+use core::future::{poll_fn, Future};
 use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
 use core::pin::Pin;
@@ -49,7 +49,7 @@ impl From<Dir> for vals::Dir {
     }
 }
 
-struct Foo(UnsafeCell<MaybeUninit<*mut (dyn FnMut(Half) -> ControlFlow<()> + Send)>>);
+struct Foo(UnsafeCell<MaybeUninit<*mut (dyn FnMut() + Send)>>);
 
 impl Foo {
     const UNINIT: Self = Self::uninit();
@@ -58,15 +58,15 @@ impl Foo {
         Self(UnsafeCell::new(MaybeUninit::uninit()))
     }
 
-    unsafe fn set<'a>(&self, closure: &'a mut (dyn FnMut(Half) -> ControlFlow<()> + Send + 'a)) {
+    unsafe fn set<'a>(&self, closure: &'a mut (dyn FnMut() + Send + 'a)) {
         // erase closure lifetime
-        let closure: &mut (dyn FnMut(Half) -> ControlFlow<()> + Send + 'static) = core::mem::transmute(closure);
+        let closure: &mut (dyn FnMut() + Send + 'static) = core::mem::transmute(closure);
         (*self.0.get()).write(closure);
     }
 
-    unsafe fn run(&self, half: Half) -> ControlFlow<()> {
+    unsafe fn run(&self) {
         let closure = &mut *(*self.0.get()).assume_init();
-        closure(half)
+        closure()
     }
 }
 
@@ -138,39 +138,8 @@ pub(crate) unsafe fn on_irq_inner(dma: pac::bdma::Dma, channel_num: usize, index
 
     if enabled_interrupts.htie() {
         // Circular mode
-        let first = isr.htif(channel_num);
-        let second = isr.tcif(channel_num);
-
-        let half = match (first, second) {
-            (true, true) => panic!("overrun before closure"),
-            (true, false) => Half::First,
-            (false, true) => Half::Second,
-            (false, false) => return,
-        };
-
-        dma.ifcr().write(|reg| match half {
-            Half::First => reg.set_htif(channel_num, true),
-            Half::Second => reg.set_tcif(channel_num, true),
-        });
-
-        let res = STATE.foo[index].run(half);
-
-        let isr_again = dma.isr().read();
-        let overran = match half {
-            Half::First => isr_again.tcif(channel_num),
-            Half::Second => isr_again.htif(channel_num),
-        };
-        if overran {
-            panic!("overrun after closure");
-        }
-
-        if res.is_break() {
-            fence(Ordering::Release);
-            cr.write(|_| ()); // Disable channel interrupts with the default value.
-
-            // STATE.foo[index].store(ptr::null_mut(), Ordering::SeqCst);
-            STATE.ch_wakers[index].wake();
-        }
+        fence(Ordering::Acquire);
+        STATE.foo[index].run();
     } else if isr.tcif(channel_num) && enabled_interrupts.tcie() {
         cr.write(|_| ()); // Disable channel interrupts with the default value.
         STATE.ch_wakers[index].wake();
@@ -432,11 +401,20 @@ pub(crate) async unsafe fn circ_dma_read<'a, C: Channel, W: Word, const N: usize
     mut f: impl FnMut(SendPtr<[W; N]>) -> ControlFlow<()> + Send + 'a,
     after_enable: impl FnOnce(),
 ) {
+    into_ref!(channel);
+
     let buffer: *mut [[W; N]; 2] = buffer;
 
     let send_ptr = SendPtr(buffer);
 
-    let mut closure = move |half| f(choose_half(send_ptr, half));
+    let waker = AtomicWaker::new();
+
+    let dma = channel.regs();
+    let channel_num = channel.num();
+
+    let mut closure = || {
+        circ_read_isr(dma, channel_num, &mut f, send_ptr, &waker);
+    };
 
     // let mut dyn_closure: &mut (dyn FnMut(Half) -> ControlFlow<()> + Send + 'a) = &mut closure;
 
@@ -444,7 +422,63 @@ pub(crate) async unsafe fn circ_dma_read<'a, C: Channel, W: Word, const N: usize
 
     after_enable();
 
-    transfer.await;
+    poll_fn(|cx| {
+        waker.register(cx.waker());
+
+        if transfer.is_running() {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    })
+    .await;
+
+    // transfer.await;
+}
+
+unsafe fn circ_read_isr<W: Word, const N: usize>(
+    dma: pac::bdma::Dma,
+    channel_num: usize,
+    f: &mut (impl FnMut(SendPtr<[W; N]>) -> ControlFlow<()> + Send),
+    send_ptr: SendPtr<[[W; N]; 2]>,
+    waker: &AtomicWaker,
+) {
+    fence(Ordering::Acquire);
+    let cr = dma.ch(channel_num).cr();
+    let isr = dma.isr().read();
+
+    let first = isr.htif(channel_num);
+    let second = isr.tcif(channel_num);
+
+    let half = match (first, second) {
+        (true, true) => panic!("overrun before closure"),
+        (true, false) => Half::First,
+        (false, true) => Half::Second,
+        (false, false) => return,
+    };
+
+    dma.ifcr().write(|reg| match half {
+        Half::First => reg.set_htif(channel_num, true),
+        Half::Second => reg.set_tcif(channel_num, true),
+    });
+
+    let res = f(choose_half(send_ptr, half));
+
+    let isr_again = dma.isr().read();
+    let overran = match half {
+        Half::First => isr_again.tcif(channel_num),
+        Half::Second => isr_again.htif(channel_num),
+    };
+    if overran {
+        panic!("overrun after closure, isr: {}", isr_again.0);
+    }
+
+    if res.is_break() {
+        fence(Ordering::Release);
+        cr.write(|_| ()); // Disable channel interrupts with the default value.
+
+        waker.wake();
+    }
 }
 
 #[must_use = "futures do nothing unless you `.await` or poll them"]
@@ -457,7 +491,7 @@ impl<'a, C: Channel> CircRead<'a, C> {
         channel: impl Peripheral<P = C> + 'a,
         peri_addr: *mut W,
         buffer: *mut [[W; N]; 2],
-        f: &'a mut (dyn FnMut(Half) -> ControlFlow<()> + Send + 'a),
+        f: &'a mut (dyn FnMut() + Send + 'a),
     ) -> Self {
         into_ref!(channel);
 
@@ -474,16 +508,9 @@ impl<'a, C: Channel> CircRead<'a, C> {
         // #[cfg(dmamux)]
         // super::dmamux::configure_dmamux(&mut *this.channel, _request);
 
-        // let send_ptr = SendPtr(buffer);
+        STATE.foo[channel.index()].set(f);
 
-        // let mut closure = move |half| f(choose_half(send_ptr, half));
-
-        // // TODO: this seems to work, but I think it is super UB. Is the pointer actually valid for 'a?
-        // let dyn_closure: *mut (dyn FnMut(Half) -> ControlFlow<()> + Send + 'a) = &mut closure;
-        // let mut dyn_closure: *mut (dyn FnMut(Half) -> ControlFlow<()> + Send + 'static) =
-        //     unsafe { core::mem::transmute(dyn_closure) };
-
-        STATE.foo[channel.index()].set(core::mem::transmute(f));
+        fence(Ordering::Release);
 
         unsafe {
             ch.par().write_value(peri_addr as u32);
@@ -505,7 +532,7 @@ impl<'a, C: Channel> CircRead<'a, C> {
         Self { channel }
     }
 
-    pub fn is_running(&mut self) -> bool {
+    pub fn is_running(&self) -> bool {
         let ch = self.channel.regs().ch(self.channel.num());
         unsafe { ch.cr().read() }.en()
     }
@@ -520,19 +547,19 @@ impl<'a, C: Channel> Drop for CircRead<'a, C> {
     }
 }
 
-impl<'a, C: Channel> Unpin for CircRead<'a, C> {}
-impl<'a, C: Channel> Future for CircRead<'a, C> {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        STATE.ch_wakers[self.channel.index()].register(cx.waker());
+// impl<'a, C: Channel> Unpin for CircRead<'a, C> {}
+// impl<'a, C: Channel> Future for CircRead<'a, C> {
+//     type Output = ();
+//     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+//         STATE.ch_wakers[self.channel.index()].register(cx.waker());
 
-        if self.is_running() {
-            Poll::Pending
-        } else {
-            Poll::Ready(())
-        }
-    }
-}
+//         if self.is_running() {
+//             Poll::Pending
+//         } else {
+//             Poll::Ready(())
+//         }
+//     }
+// }
 
 #[derive(Clone, Copy)]
 pub struct SendPtr<T>(pub *mut T);
