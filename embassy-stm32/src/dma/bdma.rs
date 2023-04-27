@@ -1,13 +1,13 @@
 #![macro_use]
 
+use core::cell::UnsafeCell;
 use core::future::Future;
+use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
 use core::pin::Pin;
-use core::ptr;
 use core::sync::atomic::{fence, Ordering};
 use core::task::{Context, Poll};
 
-use atomic_polyfill::AtomicPtr;
 use embassy_cortex_m::interrupt::Priority;
 use embassy_hal_common::{into_ref, Peripheral, PeripheralRef};
 use embassy_sync::waitqueue::AtomicWaker;
@@ -49,18 +49,40 @@ impl From<Dir> for vals::Dir {
     }
 }
 
+struct Foo(UnsafeCell<MaybeUninit<*mut (dyn FnMut(Half) -> ControlFlow<()> + Send)>>);
+
+impl Foo {
+    const UNINIT: Self = Self::uninit();
+
+    const fn uninit() -> Self {
+        Self(UnsafeCell::new(MaybeUninit::uninit()))
+    }
+
+    unsafe fn set<'a>(&self, closure: &'a mut (dyn FnMut(Half) -> ControlFlow<()> + Send + 'a)) {
+        // erase closure lifetime
+        let closure: &mut (dyn FnMut(Half) -> ControlFlow<()> + Send + 'static) = core::mem::transmute(closure);
+        (*self.0.get()).write(closure);
+    }
+
+    unsafe fn run(&self, half: Half) -> ControlFlow<()> {
+        let closure = &mut *(*self.0.get()).assume_init();
+        closure(half)
+    }
+}
+
+unsafe impl Sync for Foo {}
+
 struct State {
     ch_wakers: [AtomicWaker; BDMA_CHANNEL_COUNT],
-    foo: [AtomicPtr<*mut (dyn FnMut(Half) -> ControlFlow<()> + Send)>; BDMA_CHANNEL_COUNT],
+    foo: [Foo; BDMA_CHANNEL_COUNT],
 }
 
 impl State {
     const fn new() -> Self {
         const AW: AtomicWaker = AtomicWaker::new();
-        const FOO: AtomicPtr<*mut (dyn FnMut(Half) -> ControlFlow<()> + Send)> = AtomicPtr::new(ptr::null_mut());
         Self {
             ch_wakers: [AW; BDMA_CHANNEL_COUNT],
-            foo: [FOO; BDMA_CHANNEL_COUNT],
+            foo: [Foo::UNINIT; BDMA_CHANNEL_COUNT],
         }
     }
 }
@@ -131,15 +153,7 @@ pub(crate) unsafe fn on_irq_inner(dma: pac::bdma::Dma, channel_num: usize, index
             Half::Second => reg.set_tcif(channel_num, true),
         });
 
-        let foo = STATE.foo[index].load(Ordering::Acquire);
-        // if foo.is_null() {
-        //     return;
-        // }
-
-        let foo = *foo;
-        let foo = &mut *foo;
-
-        let res = foo(half);
+        let res = STATE.foo[index].run(half);
 
         let isr_again = dma.isr().read();
         let overran = match half {
@@ -396,9 +410,41 @@ impl<'a, C: Channel> Future for Transfer<'a, C> {
 }
 
 #[derive(Clone, Copy)]
-enum Half {
+pub(crate) enum Half {
     First,
     Second,
+}
+
+fn choose_half<T>(buffer: SendPtr<[T; 2]>, half: Half) -> SendPtr<T> {
+    let ptr = buffer.0;
+    let ptr = ptr as *mut T;
+    let ptr = match half {
+        Half::First => ptr,
+        Half::Second => unsafe { ptr.add(1) },
+    };
+    SendPtr(ptr)
+}
+
+pub(crate) async unsafe fn circ_dma_read<'a, C: Channel, W: Word, const N: usize>(
+    channel: impl Peripheral<P = C> + 'a,
+    peri_addr: *mut W,
+    buffer: &'a mut [[W; N]; 2],
+    mut f: impl FnMut(SendPtr<[W; N]>) -> ControlFlow<()> + Send + 'a,
+    after_enable: impl FnOnce(),
+) {
+    let buffer: *mut [[W; N]; 2] = buffer;
+
+    let send_ptr = SendPtr(buffer);
+
+    let mut closure = move |half| f(choose_half(send_ptr, half));
+
+    // let mut dyn_closure: &mut (dyn FnMut(Half) -> ControlFlow<()> + Send + 'a) = &mut closure;
+
+    let transfer = CircRead::new(channel, peri_addr, buffer, &mut closure);
+
+    after_enable();
+
+    transfer.await;
 }
 
 #[must_use = "futures do nothing unless you `.await` or poll them"]
@@ -407,11 +453,11 @@ pub struct CircRead<'a, C: Channel> {
 }
 
 impl<'a, C: Channel> CircRead<'a, C> {
-    pub unsafe fn new<W: Word, const N: usize>(
+    pub(crate) unsafe fn new<W: Word, const N: usize>(
         channel: impl Peripheral<P = C> + 'a,
         peri_addr: *mut W,
-        buffer: &'a mut [[W; N]; 2],
-        mut f: impl FnMut(SendPtr<[W; N]>) -> ControlFlow<()> + Send + 'a,
+        buffer: *mut [[W; N]; 2],
+        f: &'a mut (dyn FnMut(Half) -> ControlFlow<()> + Send + 'a),
     ) -> Self {
         into_ref!(channel);
 
@@ -428,25 +474,16 @@ impl<'a, C: Channel> CircRead<'a, C> {
         // #[cfg(dmamux)]
         // super::dmamux::configure_dmamux(&mut *this.channel, _request);
 
-        fn choose_half<T>(buffer: SendPtr<[T; 2]>, half: Half) -> SendPtr<T> {
-            let ptr = buffer.0;
-            let ptr = ptr as *mut T;
-            let ptr = match half {
-                Half::First => ptr,
-                Half::Second => unsafe { ptr.add(1) },
-            };
-            SendPtr(ptr)
-        }
+        // let send_ptr = SendPtr(buffer);
 
-        let send_ptr = SendPtr(buffer);
+        // let mut closure = move |half| f(choose_half(send_ptr, half));
 
-        let mut closure = move |half| f(choose_half(send_ptr, half));
+        // // TODO: this seems to work, but I think it is super UB. Is the pointer actually valid for 'a?
+        // let dyn_closure: *mut (dyn FnMut(Half) -> ControlFlow<()> + Send + 'a) = &mut closure;
+        // let mut dyn_closure: *mut (dyn FnMut(Half) -> ControlFlow<()> + Send + 'static) =
+        //     unsafe { core::mem::transmute(dyn_closure) };
 
-        let dyn_closure: *mut (dyn FnMut(Half) -> ControlFlow<()> + Send + 'a) = &mut closure;
-        let mut dyn_closure: *mut (dyn FnMut(Half) -> ControlFlow<()> + Send + 'static) =
-            unsafe { core::mem::transmute(dyn_closure) };
-
-        STATE.foo[channel.index()].store(&mut dyn_closure, Ordering::Release);
+        STATE.foo[channel.index()].set(core::mem::transmute(f));
 
         unsafe {
             ch.par().write_value(peri_addr as u32);
