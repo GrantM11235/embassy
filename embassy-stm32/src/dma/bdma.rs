@@ -1,6 +1,6 @@
 #![macro_use]
 
-use core::future::{poll_fn, Future};
+use core::future::Future;
 use core::ops::ControlFlow;
 use core::pin::Pin;
 use core::ptr;
@@ -111,32 +111,30 @@ pub(crate) unsafe fn on_irq_inner(dma: pac::bdma::Dma, channel_num: usize, index
     if isr.teif(channel_num) {
         panic!("DMA: error on BDMA@{:08x} channel {}", dma.0 as u32, channel_num);
     }
-    if cr.read().htie() {
+
+    let enabled_interrupts = cr.read();
+
+    if enabled_interrupts.htie() {
         // Circular mode
         let first = isr.htif(channel_num);
         let second = isr.tcif(channel_num);
 
         let half = match (first, second) {
-            (true, true) => panic!("Overrun before closure"),
-            (true, false) => {
-                dma.ifcr().write(|reg| {
-                    reg.set_htif(channel_num, true);
-                });
-                Half::First
-            }
-            (false, true) => {
-                dma.ifcr().write(|reg| {
-                    reg.set_tcif(channel_num, true);
-                });
-                Half::Second
-            }
+            (true, true) => panic!("overrun before closure"),
+            (true, false) => Half::First,
+            (false, true) => Half::Second,
             (false, false) => return,
         };
 
-        let foo = STATE.foo[index].load(Ordering::SeqCst);
-        if foo.is_null() {
-            return;
-        }
+        dma.ifcr().write(|reg| match half {
+            Half::First => reg.set_htif(channel_num, true),
+            Half::Second => reg.set_tcif(channel_num, true),
+        });
+
+        let foo = STATE.foo[index].load(Ordering::Acquire);
+        // if foo.is_null() {
+        //     return;
+        // }
 
         let foo = *foo;
         let foo = &mut *foo;
@@ -144,20 +142,22 @@ pub(crate) unsafe fn on_irq_inner(dma: pac::bdma::Dma, channel_num: usize, index
         let res = foo(half);
 
         let isr_again = dma.isr().read();
-        let overflowed = match half {
+        let overran = match half {
             Half::First => isr_again.tcif(channel_num),
             Half::Second => isr_again.htif(channel_num),
         };
-        if overflowed {
-            panic!("Overflow after closure");
+        if overran {
+            panic!("overrun after closure");
         }
 
         if res.is_break() {
+            fence(Ordering::Release);
             cr.write(|_| ()); // Disable channel interrupts with the default value.
-            STATE.foo[index].store(ptr::null_mut(), Ordering::SeqCst);
+
+            // STATE.foo[index].store(ptr::null_mut(), Ordering::SeqCst);
             STATE.ch_wakers[index].wake();
         }
-    } else if isr.tcif(channel_num) && cr.read().tcie() {
+    } else if isr.tcif(channel_num) && enabled_interrupts.tcie() {
         cr.write(|_| ()); // Disable channel interrupts with the default value.
         STATE.ch_wakers[index].wake();
     }
@@ -395,27 +395,27 @@ impl<'a, C: Channel> Future for Transfer<'a, C> {
     }
 }
 
-pub struct CircRead<'a, C: Channel, W: Word, const N: usize> {
-    channel: PeripheralRef<'a, C>,
-    buffer: *mut [[W; N]; 2],
-}
-
 #[derive(Clone, Copy)]
 enum Half {
     First,
     Second,
 }
 
-impl<'a, C: Channel, W: Word, const N: usize> CircRead<'a, C, W, N> {
-    pub unsafe fn new(channel: impl Peripheral<P = C> + 'a, peri_addr: *mut W, buffer: &'a mut [[W; N]; 2]) -> Self {
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct CircRead<'a, C: Channel> {
+    channel: PeripheralRef<'a, C>,
+}
+
+impl<'a, C: Channel> CircRead<'a, C> {
+    pub unsafe fn new<W: Word, const N: usize>(
+        channel: impl Peripheral<P = C> + 'a,
+        peri_addr: *mut W,
+        buffer: &'a mut [[W; N]; 2],
+        mut f: impl FnMut(SendPtr<[W; N]>) -> ControlFlow<()> + Send + 'a,
+    ) -> Self {
         into_ref!(channel);
 
-        let data_size = W::size();
-
         let ch = channel.regs().ch(channel.num());
-
-        // "Preceding reads and writes cannot be moved past subsequent writes."
-        fence(Ordering::SeqCst);
 
         // #[cfg(bdma_v2)]
         // critical_section::with(|_| channel.regs().cselr().modify(|w| w.set_cs(channel.num(), _request)));
@@ -428,13 +428,33 @@ impl<'a, C: Channel, W: Word, const N: usize> CircRead<'a, C, W, N> {
         // #[cfg(dmamux)]
         // super::dmamux::configure_dmamux(&mut *this.channel, _request);
 
+        fn choose_half<T>(buffer: SendPtr<[T; 2]>, half: Half) -> SendPtr<T> {
+            let ptr = buffer.0;
+            let ptr = ptr as *mut T;
+            let ptr = match half {
+                Half::First => ptr,
+                Half::Second => unsafe { ptr.add(1) },
+            };
+            SendPtr(ptr)
+        }
+
+        let send_ptr = SendPtr(buffer);
+
+        let mut closure = move |half| f(choose_half(send_ptr, half));
+
+        let dyn_closure: *mut (dyn FnMut(Half) -> ControlFlow<()> + Send + 'a) = &mut closure;
+        let mut dyn_closure: *mut (dyn FnMut(Half) -> ControlFlow<()> + Send + 'static) =
+            unsafe { core::mem::transmute(dyn_closure) };
+
+        STATE.foo[channel.index()].store(&mut dyn_closure, Ordering::Release);
+
         unsafe {
             ch.par().write_value(peri_addr as u32);
             ch.mar().write_value(buffer as *mut _ as u32);
             ch.ndtr().write(|w| w.set_ndt(N as u16 * 2));
             ch.cr().write(|w| {
-                w.set_psize(data_size.into());
-                w.set_msize(data_size.into());
+                w.set_psize(W::size().into());
+                w.set_msize(W::size().into());
                 w.set_minc(vals::Inc::ENABLED);
                 w.set_circ(vals::Circ::ENABLED);
                 w.set_dir(Dir::PeripheralToMemory.into());
@@ -445,97 +465,35 @@ impl<'a, C: Channel, W: Word, const N: usize> CircRead<'a, C, W, N> {
             });
         }
 
-        Self { channel, buffer }
+        Self { channel }
     }
 
-    // async fn wait(&self) -> Half {
-    //     poll_fn(|cx| {
-    //         let foo = STATE.foo[self.channel.index()].load(Ordering::SeqCst);
+    pub fn is_running(&mut self) -> bool {
+        let ch = self.channel.regs().ch(self.channel.num());
+        unsafe { ch.cr().read() }.en()
+    }
+}
 
-    //         match foo {
-    //             0 => {
-    //                 STATE.ch_wakers[self.channel.index()].register(cx.waker());
-    //                 Poll::Pending
-    //             }
-    //             1 => Poll::Ready(Half::First),
-    //             2 => Poll::Ready(Half::Second),
-    //             _ => panic!("Overrun"),
-    //         }
-    //     })
-    //     .await
-    // }
-
-    // async fn do_once<R>(&mut self, f: impl FnOnce(*mut [W; N]) -> R) -> R {
-    //     let half = self.wait().await;
-
-    //     let ptr = self.buffer;
-    //     let ptr = ptr as *mut [W; N];
-    //     let ptr = match half {
-    //         Half::First => ptr,
-    //         Half::Second => unsafe { ptr.add(1) },
-    //     };
-
-    //     let res = f(ptr);
-
-    //     self.mark_half_done(half);
-
-    //     res
-    // }
-
-    pub async fn do_while(self, mut f: impl FnMut(SendPtr<[W; N]>) -> ControlFlow<()> + Send + 'a) {
-        let buffer = SendPtr(self.buffer);
-
-        fn pick_half<T>(buffer: SendPtr<[T; 2]>, half: Half) -> SendPtr<T> {
-            let ptr = buffer.0;
-            let ptr = ptr as *mut T;
-            let ptr = match half {
-                Half::First => ptr,
-                Half::Second => unsafe { ptr.add(1) },
-            };
-            SendPtr(ptr)
+impl<'a, C: Channel> Drop for CircRead<'a, C> {
+    fn drop(&mut self) {
+        if self.is_running() {
+            panic!("circular transfers must not be dropped while running")
         }
+        fence(Ordering::Acquire);
+    }
+}
 
-        // unsafe fn extend_lifetime<'b>(
-        //     f: impl FnMut(SendPtr<[W; N]>) -> ControlFlow<()> + Send + 'b,
-        // ) -> impl FnMut(SendPtr<[W; N]>) -> ControlFlow<()> + Send + 'static {
-        //     core::mem::transmute(f)
-        // }
+impl<'a, C: Channel> Unpin for CircRead<'a, C> {}
+impl<'a, C: Channel> Future for CircRead<'a, C> {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        STATE.ch_wakers[self.channel.index()].register(cx.waker());
 
-        let mut closure = move |half| {
-            // let ptr = buffer.0;
-            // let ptr = ptr as *mut [W; N];
-            // let ptr = match half {
-            //     Half::First => ptr,
-            //     Half::Second => unsafe { ptr.add(1) },
-            // };
-            f(pick_half(buffer, half))
-        };
-        let dyn_closure: *mut (dyn FnMut(Half) -> ControlFlow<()> + Send + 'a) = &mut closure;
-        let mut dyn_closure: *mut (dyn FnMut(Half) -> ControlFlow<()> + Send + 'static) =
-            unsafe { core::mem::transmute(dyn_closure) };
-        let dyn_closure_ptr = &mut dyn_closure;
-
-        STATE.foo[self.channel.index()].store(dyn_closure_ptr, Ordering::SeqCst);
-
-        poll_fn(|cx| {
-            let ptr = STATE.foo[self.channel.index()].load(Ordering::SeqCst);
-            if ptr.is_null() {
-                Poll::Ready(())
-            } else {
-                STATE.ch_wakers[self.channel.index()].register(cx.waker());
-                Poll::Pending
-            }
-        })
-        .await;
-
-        // loop {
-        //     let res = self.do_once(&mut f).await;
-
-        //     if let ControlFlow::Break(res) = res {
-        //         unsafe { self.channel.regs().ch(self.channel.num()).cr().write(|_| {}) }; // Disable channel interrupts with the default value.
-        //         return res;
-        //     }
-        // }
+        if self.is_running() {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
     }
 }
 

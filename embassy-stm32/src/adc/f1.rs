@@ -2,6 +2,7 @@ use embassy_hal_common::into_ref;
 use embedded_hal_02::blocking::delay::DelayUs;
 
 use crate::adc::{Adc, AdcPin, Instance, SampleTime};
+use crate::dma::CircRead;
 use crate::rcc::get_freqs;
 use crate::time::Hertz;
 use crate::{dma, Peripheral};
@@ -181,30 +182,26 @@ impl<'d> Adc<'d, ADC1> {
         transfer
     }
 
-    pub async fn circ_dma_read<'a, const N: usize>(
+    pub fn circ_dma_read<'a, const N: usize>(
         &'a mut self,
         pin: &'a mut impl AdcPin<ADC1>,
         buffer: &'a mut [[u16; N]; 2],
-        dma: &'a mut DMA1_CH1,
-        f: impl FnMut(crate::dma::bdma::SendPtr<[u16; N]>) -> core::ops::ControlFlow<()> + Send,
-    ) {
+        channel: &'a mut DMA1_CH1,
+        f: impl FnMut(crate::dma::SendPtr<[u16; N]>) -> core::ops::ControlFlow<()> + Send + 'a,
+    ) -> CircRead<DMA1_CH1> {
         unsafe {
             self.regs().cr1().modify(|reg| reg.set_discen(false));
             Self::set_channel_sample_time(pin.channel(), self.sample_time);
             self.regs().sqr3().write(|reg| reg.set_sq(0, pin.channel()));
             self.regs().cr2().modify(|reg| reg.set_dma(true));
-        }
 
-        let transfer = unsafe {
             let peri_addr = self.regs().dr().ptr() as *mut u16;
-            dma::CircRead::new(dma, peri_addr, buffer)
-        };
+            let transfer = dma::CircRead::new(channel, peri_addr, buffer, f);
 
-        unsafe {
             self.regs().cr2().modify(|reg| reg.set_cont(true));
             self.regs().cr2().modify(|reg| reg.set_adon(true));
-        }
 
-        transfer.do_while(f).await
+            transfer
+        }
     }
 }
