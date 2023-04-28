@@ -49,7 +49,11 @@ impl From<Dir> for vals::Dir {
     }
 }
 
-struct Foo(UnsafeCell<MaybeUninit<*mut (dyn FnMut() + Send)>>);
+fn call_mut<'a, F: FnMut() + Send + 'a>(f: &mut F) {
+    f()
+}
+
+struct Foo(UnsafeCell<MaybeUninit<(fn(*mut ()), *mut ())>>);
 
 impl Foo {
     const UNINIT: Self = Self::uninit();
@@ -58,15 +62,18 @@ impl Foo {
         Self(UnsafeCell::new(MaybeUninit::uninit()))
     }
 
-    unsafe fn set<'a>(&self, closure: &'a mut (dyn FnMut() + Send + 'a)) {
-        // erase closure lifetime
-        let closure: &mut (dyn FnMut() + Send + 'static) = core::mem::transmute(closure);
-        (*self.0.get()).write(closure);
+    unsafe fn set<'a, F: FnMut() + Send + 'a>(&self, closure: &'a mut F) {
+        let ctx = closure as *mut F as *mut ();
+
+        let fn_ptr: for<'b> fn(&'b mut F) = call_mut::<F>;
+        let fn_ptr = core::mem::transmute(fn_ptr);
+
+        (*self.0.get()).write((fn_ptr, ctx));
     }
 
     unsafe fn run(&self) {
-        let closure = &mut *(*self.0.get()).assume_init();
-        closure()
+        let (fn_ptr, ctx) = (*self.0.get()).assume_init();
+        fn_ptr(ctx);
     }
 }
 
@@ -443,7 +450,7 @@ unsafe fn circ_read_isr<W: Word, const N: usize>(
     send_ptr: SendPtr<[[W; N]; 2]>,
     waker: &AtomicWaker,
 ) {
-    fence(Ordering::Acquire);
+    // fence(Ordering::Acquire);
     let cr = dma.ch(channel_num).cr();
     let isr = dma.isr().read();
 
@@ -491,7 +498,7 @@ impl<'a, C: Channel> CircRead<'a, C> {
         channel: impl Peripheral<P = C> + 'a,
         peri_addr: *mut W,
         buffer: *mut [[W; N]; 2],
-        f: &'a mut (dyn FnMut() + Send + 'a),
+        f: &'a mut (impl FnMut() + Send + 'a),
     ) -> Self {
         into_ref!(channel);
 
