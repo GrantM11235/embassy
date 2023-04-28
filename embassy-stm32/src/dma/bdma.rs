@@ -2,11 +2,11 @@
 
 use core::cell::UnsafeCell;
 use core::future::{poll_fn, Future};
-use core::mem::MaybeUninit;
+use core::mem::ManuallyDrop;
 use core::ops::ControlFlow;
 use core::pin::Pin;
 use core::sync::atomic::{fence, Ordering};
-use core::task::{Context, Poll};
+use core::task::{Context, Poll, Waker};
 
 use embassy_cortex_m::interrupt::Priority;
 use embassy_hal_common::{into_ref, Peripheral, PeripheralRef};
@@ -53,43 +53,68 @@ fn call_mut<'a, F: FnMut() + Send + 'a>(f: &mut F) {
     f()
 }
 
-struct Foo(UnsafeCell<MaybeUninit<(fn(*mut ()), *mut ())>>);
+struct Foo {
+    fn_ptr: fn(*mut ()),
+    ctx: *mut (),
+}
 
 impl Foo {
-    const UNINIT: Self = Self::uninit();
-
-    const fn uninit() -> Self {
-        Self(UnsafeCell::new(MaybeUninit::uninit()))
-    }
-
-    unsafe fn set<'a, F: FnMut() + Send + 'a>(&self, closure: &'a mut F) {
+    unsafe fn new<'a, F: FnMut() + Send + 'a>(closure: &'a mut F) -> Self {
         let ctx = closure as *mut F as *mut ();
 
         let fn_ptr: for<'b> fn(&'b mut F) = call_mut::<F>;
         let fn_ptr = core::mem::transmute(fn_ptr);
 
-        (*self.0.get()).write((fn_ptr, ctx));
+        Self { fn_ptr, ctx }
     }
 
-    unsafe fn run(&self) {
-        let (fn_ptr, ctx) = (*self.0.get()).assume_init();
-        fn_ptr(ctx);
+    unsafe fn run(&mut self) {
+        (self.fn_ptr)(self.ctx)
     }
 }
 
 unsafe impl Sync for Foo {}
 
+union ChannelState {
+    uninit: (),
+    waker: ManuallyDrop<UnsafeCell<AtomicWaker>>,
+    foo: ManuallyDrop<UnsafeCell<Foo>>,
+}
+
+unsafe impl Sync for ChannelState {}
+
+impl ChannelState {
+    const UNINIT: Self = Self { uninit: () };
+
+    unsafe fn init_waker(&self) {
+        (*self.waker.get()) = AtomicWaker::new();
+    }
+
+    unsafe fn register_waker(&self, waker: &Waker) {
+        (*self.waker.get()).register(waker)
+    }
+
+    unsafe fn wake_and_drop(&self) {
+        (*self.waker.get()).wake_and_clear()
+    }
+
+    unsafe fn set_foo<'a, F: FnMut() + Send + 'a>(&self, closure: &'a mut F) {
+        (*self.foo.get()) = Foo::new(closure);
+    }
+
+    unsafe fn run_foo(&self) {
+        (*self.foo.get()).run()
+    }
+}
+
 struct State {
-    ch_wakers: [AtomicWaker; BDMA_CHANNEL_COUNT],
-    foo: [Foo; BDMA_CHANNEL_COUNT],
+    state: [ChannelState; BDMA_CHANNEL_COUNT],
 }
 
 impl State {
     const fn new() -> Self {
-        const AW: AtomicWaker = AtomicWaker::new();
         Self {
-            ch_wakers: [AW; BDMA_CHANNEL_COUNT],
-            foo: [Foo::UNINIT; BDMA_CHANNEL_COUNT],
+            state: [ChannelState::UNINIT; BDMA_CHANNEL_COUNT],
         }
     }
 }
@@ -146,10 +171,10 @@ pub(crate) unsafe fn on_irq_inner(dma: pac::bdma::Dma, channel_num: usize, index
     if enabled_interrupts.htie() {
         // Circular mode
         fence(Ordering::Acquire);
-        STATE.foo[index].run();
+        STATE.state[index].run_foo();
     } else if isr.tcif(channel_num) && enabled_interrupts.tcie() {
         cr.write(|_| ()); // Disable channel interrupts with the default value.
-        STATE.ch_wakers[index].wake();
+        STATE.state[index].wake_and_drop();
     }
 }
 
@@ -298,6 +323,8 @@ impl<'a, C: Channel> Transfer<'a, C> {
         #[cfg(dmamux)]
         super::dmamux::configure_dmamux(&mut *this.channel, _request);
 
+        STATE.state[this.channel.index()].init_waker();
+
         ch.par().write_value(peri_addr as u32);
         ch.mar().write_value(mem_addr as u32);
         ch.ndtr().write(|w| w.set_ndt(mem_len as u16));
@@ -375,7 +402,9 @@ impl<'a, C: Channel> Unpin for Transfer<'a, C> {}
 impl<'a, C: Channel> Future for Transfer<'a, C> {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        STATE.ch_wakers[self.channel.index()].register(cx.waker());
+        unsafe {
+            STATE.state[self.channel.index()].register_waker(cx.waker());
+        }
 
         if self.is_running() {
             Poll::Pending
@@ -515,7 +544,7 @@ impl<'a, C: Channel> CircRead<'a, C> {
         // #[cfg(dmamux)]
         // super::dmamux::configure_dmamux(&mut *this.channel, _request);
 
-        STATE.foo[channel.index()].set(f);
+        STATE.state[channel.index()].set_foo(f);
 
         fence(Ordering::Release);
 
