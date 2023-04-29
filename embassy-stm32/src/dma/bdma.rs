@@ -49,23 +49,23 @@ impl From<Dir> for vals::Dir {
     }
 }
 
-fn call_mut<'a, F: FnMut() + Send + 'a>(f: &mut F) {
-    f()
+unsafe fn call_mut<'a, F: FnMut() + Send + 'a>(f: *mut F) {
+    (&mut *f)()
 }
 
-struct Foo {
-    fn_ptr: fn(*mut ()),
+struct DynFnMut {
     ctx: *mut (),
+    fn_ptr: unsafe fn(*mut ()),
 }
 
-impl Foo {
-    unsafe fn new<'a, F: FnMut() + Send + 'a>(closure: &'a mut F) -> Self {
-        let ctx = closure as *mut F as *mut ();
+impl DynFnMut {
+    unsafe fn new<'a, F: FnMut() + Send + 'a>(f: &'a mut F) -> Self {
+        let ctx = f as *mut F as *mut ();
 
-        let fn_ptr: for<'b> fn(&'b mut F) = call_mut::<F>;
-        let fn_ptr = core::mem::transmute(fn_ptr);
+        let fn_ptr: unsafe fn(*mut F) = call_mut::<F>;
+        let fn_ptr: unsafe fn(*mut ()) = core::mem::transmute(fn_ptr);
 
-        Self { fn_ptr, ctx }
+        Self { ctx, fn_ptr }
     }
 
     unsafe fn run(&mut self) {
@@ -73,12 +73,12 @@ impl Foo {
     }
 }
 
-unsafe impl Sync for Foo {}
+unsafe impl Send for DynFnMut {}
 
 union ChannelState {
     uninit: (),
     waker: ManuallyDrop<UnsafeCell<AtomicWaker>>,
-    foo: ManuallyDrop<UnsafeCell<Foo>>,
+    foo: ManuallyDrop<UnsafeCell<DynFnMut>>,
 }
 
 unsafe impl Sync for ChannelState {}
@@ -94,15 +94,15 @@ impl ChannelState {
         (*self.waker.get()).register(waker)
     }
 
-    unsafe fn wake_and_drop(&self) {
+    unsafe fn wake_and_clear(&self) {
         (*self.waker.get()).wake_and_clear()
     }
 
-    unsafe fn set_foo<'a, F: FnMut() + Send + 'a>(&self, closure: &'a mut F) {
-        (*self.foo.get()) = Foo::new(closure);
+    unsafe fn set_circ_isr<'a, F: FnMut() + Send + 'a>(&self, closure: &'a mut F) {
+        (*self.foo.get()) = DynFnMut::new(closure);
     }
 
-    unsafe fn run_foo(&self) {
+    unsafe fn run_circ_isr(&self) {
         (*self.foo.get()).run()
     }
 }
@@ -171,10 +171,10 @@ pub(crate) unsafe fn on_irq_inner(dma: pac::bdma::Dma, channel_num: usize, index
     if enabled_interrupts.htie() {
         // Circular mode
         fence(Ordering::Acquire);
-        STATE.state[index].run_foo();
+        STATE.state[index].run_circ_isr();
     } else if isr.tcif(channel_num) && enabled_interrupts.tcie() {
         cr.write(|_| ()); // Disable channel interrupts with the default value.
-        STATE.state[index].wake_and_drop();
+        STATE.state[index].wake_and_clear();
     }
 }
 
@@ -448,13 +448,13 @@ pub(crate) async unsafe fn circ_dma_read<'a, C: Channel, W: Word, const N: usize
     let dma = channel.regs();
     let channel_num = channel.num();
 
-    let mut closure = || {
+    let mut isr = || {
         circ_read_isr(dma, channel_num, &mut f, send_ptr, &waker);
     };
 
     // let mut dyn_closure: &mut (dyn FnMut(Half) -> ControlFlow<()> + Send + 'a) = &mut closure;
 
-    let transfer = CircRead::new(channel, peri_addr, buffer, &mut closure);
+    let transfer = CircTransfer::new(channel, peri_addr, buffer, &mut isr);
 
     after_enable();
 
@@ -468,8 +468,6 @@ pub(crate) async unsafe fn circ_dma_read<'a, C: Channel, W: Word, const N: usize
         }
     })
     .await;
-
-    // transfer.await;
 }
 
 unsafe fn circ_read_isr<W: Word, const N: usize>(
@@ -506,7 +504,7 @@ unsafe fn circ_read_isr<W: Word, const N: usize>(
         Half::Second => isr_again.htif(channel_num),
     };
     if overran {
-        panic!("overrun after closure, isr: {}", isr_again.0);
+        panic!("overrun after closure");
     }
 
     if res.is_break() {
@@ -518,16 +516,16 @@ unsafe fn circ_read_isr<W: Word, const N: usize>(
 }
 
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct CircRead<'a, C: Channel> {
+pub struct CircTransfer<'a, C: Channel> {
     channel: PeripheralRef<'a, C>,
 }
 
-impl<'a, C: Channel> CircRead<'a, C> {
+impl<'a, C: Channel> CircTransfer<'a, C> {
     pub(crate) unsafe fn new<W: Word, const N: usize>(
         channel: impl Peripheral<P = C> + 'a,
         peri_addr: *mut W,
         buffer: *mut [[W; N]; 2],
-        f: &'a mut (impl FnMut() + Send + 'a),
+        isr: &'a mut (impl FnMut() + Send + 'a),
     ) -> Self {
         into_ref!(channel);
 
@@ -544,7 +542,7 @@ impl<'a, C: Channel> CircRead<'a, C> {
         // #[cfg(dmamux)]
         // super::dmamux::configure_dmamux(&mut *this.channel, _request);
 
-        STATE.state[channel.index()].set_foo(f);
+        STATE.state[channel.index()].set_circ_isr(isr);
 
         fence(Ordering::Release);
 
@@ -574,7 +572,7 @@ impl<'a, C: Channel> CircRead<'a, C> {
     }
 }
 
-impl<'a, C: Channel> Drop for CircRead<'a, C> {
+impl<'a, C: Channel> Drop for CircTransfer<'a, C> {
     fn drop(&mut self) {
         if self.is_running() {
             panic!("circular transfers must not be dropped while running")

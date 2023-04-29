@@ -48,12 +48,4 @@ impl AtomicWaker {
             }
         })
     }
-
-    /// Remove and drop the registered waker, if any.
-    pub fn clear(&self) {
-        critical_section::with(|cs| {
-            let cell = self.waker.borrow(cs);
-            cell.set(None)
-        })
-    }
 }
