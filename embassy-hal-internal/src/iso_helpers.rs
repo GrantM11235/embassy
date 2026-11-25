@@ -34,10 +34,10 @@ impl IsoOffer {
 /// A gap of more than one revolution of the frame counter is counted as a single wrap.
 #[derive(Clone, Debug, Default)]
 pub struct IsoSchedule {
-    /// Running frame count.
-    last_ext: u64,
-    last_frame: u64,
-    last_written: Option<u64>,
+    /// Running frame count, wrapping.
+    last_ext: u32,
+    last_frame: u32,
+    last_written: Option<u32>,
 }
 
 impl IsoSchedule {
@@ -60,19 +60,27 @@ impl IsoSchedule {
     /// Offer the next slot when the frame counter reads `now`.
     ///
     /// `interval` is the service interval in frame-counter ticks, at least 1 and less than
-    /// `span`. `span` is the counter modulus. `now` is taken modulo `span`.
+    /// `span`. `span` is the counter modulus, a power of two. `now` is taken modulo `span`.
     /// `phase` is the host polling phase locked from a completed IN transfer, if any.
     pub fn offer(&mut self, now: u32, interval: u32, span: u32, phase: Option<u32>) -> IsoOffer {
-        let interval = u64::from(interval.max(1));
+        let interval = interval.max(1);
         let span = span.max(1);
-        let ext = self.last_ext + u64::from(forward((self.last_ext % u64::from(span)) as u32, now, span));
+        let ext = self.last_ext.wrapping_add(forward(self.last_ext, now, span));
         self.last_ext = ext;
 
-        let phase = u64::from(phase.unwrap_or(0)) % interval;
+        let phase = phase.unwrap_or(0) % interval;
         // Smallest frame after `ext` and the last written interval, with `frame % interval == phase`.
+        let next = ext.wrapping_add(1);
         let min_frame = match self.last_written {
-            Some(written) => (ext + 1).max(written + interval),
-            None => ext + 1,
+            Some(written) => {
+                let after = written.wrapping_add(interval);
+                if (after.wrapping_sub(next) as i32) > 0 {
+                    after
+                } else {
+                    next
+                }
+            }
+            None => next,
         };
         let rem = min_frame % interval;
         let add = if phase >= rem {
@@ -80,16 +88,16 @@ impl IsoSchedule {
         } else {
             interval - (rem - phase)
         };
-        let frame = min_frame + add;
+        let frame = min_frame.wrapping_add(add);
 
         // Cumulative since the last write; nothing counts as skipped before the first one.
         let skipped = self
             .last_written
-            .and_then(|written| NonZeroU32::new((frame.saturating_sub(written) / interval).saturating_sub(1) as u32));
+            .and_then(|written| NonZeroU32::new((frame.wrapping_sub(written) / interval).saturating_sub(1)));
 
         self.last_frame = frame;
 
-        IsoOffer::new((frame % u64::from(span)) as u32, skipped)
+        IsoOffer::new(frame % span, skipped)
     }
 
     /// Record a write attempt for the most recently offered slot.
@@ -205,6 +213,19 @@ mod tests {
         let next = schedule.offer(0, 1, 16, None);
         assert_eq!(next.frame, 1);
         assert_eq!(next.skipped, None);
+    }
+
+    #[test]
+    fn the_running_count_wrapping_keeps_skip_counts() {
+        let mut schedule = IsoSchedule::new();
+        schedule.last_ext = 0u32.wrapping_sub(2048) + 2040;
+        let first = schedule.offer(2040, 1, 2048, None);
+        assert_eq!(first.frame, 2041);
+        schedule.accept();
+
+        let next = schedule.offer(20, 1, 2048, None);
+        assert_eq!(next.frame, 21);
+        assert_eq!(next.skipped, NonZeroU32::new(27));
     }
 
     #[test]
