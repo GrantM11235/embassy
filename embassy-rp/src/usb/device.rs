@@ -483,7 +483,6 @@ impl<'d, T: Instance> Driver<'d, T> {
                 interval,
             ),
             buf,
-            schedule: IsoSchedule::new(),
         })
     }
 }
@@ -1097,7 +1096,6 @@ pub struct Endpoint<'d, T: Instance, D> {
     _phantom: PhantomData<(&'d mut T, D)>,
     info: EndpointInfo,
     buf: EndpointBuffer<T>,
-    schedule: IsoSchedule,
 }
 
 impl<'d, T: Instance> driver::Endpoint for Endpoint<'d, T, In> {
@@ -1294,15 +1292,20 @@ impl<'d, T: Instance> driver::EndpointIn for Endpoint<'d, T, In> {
     }
 }
 
+/// Isochronous IN scheduling state for [`IsoEndpointIn::ready`].
+#[derive(Default)]
+pub struct IsoState(IsoSchedule);
+
 /// Reserved isochronous IN slot returned by [`IsoEndpointIn::ready`].
 pub struct IsoSlot<'a, 'd, T: Instance> {
     ep: &'a mut Endpoint<'d, T, In>,
+    state: &'a mut IsoState,
     frame: u32,
 }
 
 impl<T: Instance> IsoInSlot for IsoSlot<'_, '_, T> {
     fn write(self, data: &[u8]) -> Result<(), IsoWriteError> {
-        self.ep.schedule.accept();
+        self.state.0.accept();
         let index = self.ep.info.addr.index();
         if data.len() > usize::from(self.ep.info.max_packet_size) {
             return Err(IsoWriteError::BufferOverflow);
@@ -1365,12 +1368,16 @@ impl<'d, T: Instance> Endpoint<'d, T, In> {
 }
 
 impl<'d, T: Instance> IsoEndpointIn for Endpoint<'d, T, In> {
+    type State = IsoState;
     type Slot<'a>
         = IsoSlot<'a, 'd, T>
     where
         Self: 'a;
 
-    async fn ready(&mut self) -> Result<(Option<NonZeroU32>, Self::Slot<'_>), EndpointDisabledError> {
+    async fn ready<'a>(
+        &'a mut self,
+        state: &'a mut IsoState,
+    ) -> Result<(Option<NonZeroU32>, Self::Slot<'a>), EndpointDisabledError> {
         assert_eq!(
             self.info.ep_type,
             EndpointType::Isochronous,
@@ -1412,16 +1419,16 @@ impl<'d, T: Instance> IsoEndpointIn for Endpoint<'d, T, In> {
             let mut iso = ISO_IN_STATE.borrow(cs).borrow_mut();
             if iso[index].reset {
                 iso[index].reset = false;
-                self.schedule.reset();
+                state.0.reset();
             }
             if let Some(phase) = iso[index].phase {
-                self.schedule.lock_phase(u32::from(phase), interval);
+                state.0.lock_phase(u32::from(phase), interval);
             }
         });
 
         let mut current = now;
         loop {
-            let offer = self.schedule.offer(current, interval, ISO_FRAME_SPAN);
+            let offer = state.0.offer(current, interval, ISO_FRAME_SPAN);
             let skipped = offer.skipped;
             let frame = offer.frame;
 
@@ -1457,7 +1464,7 @@ impl<'d, T: Instance> IsoEndpointIn for Endpoint<'d, T, In> {
             .await?;
 
             if ready.is_some() {
-                return Ok((skipped, IsoSlot { ep: self, frame }));
+                return Ok((skipped, IsoSlot { ep: self, state, frame }));
             }
 
             current = critical_section::with(|cs| u32::from(ISO_SOF.borrow(cs).borrow().last_sof));

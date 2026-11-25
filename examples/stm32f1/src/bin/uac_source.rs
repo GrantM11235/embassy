@@ -13,7 +13,7 @@ use embassy_usb::class::uac::device::source::{
     AudioSource, Config as SourceConfig, ControlMonitor, FeatureUnitControls, State,
 };
 use embassy_usb::class::uac::terminal_type::TerminalType;
-use embassy_usb::driver::{Endpoint as _, IsoEndpointIn as _, IsoInSlot as _};
+use embassy_usb::driver::{IsoIn, IsoInSlot as _};
 use embassy_usb::{Builder, UsbVersion};
 use panic_probe as _;
 use static_cell::StaticCell;
@@ -47,7 +47,7 @@ async fn usb_bus(
 
 #[embassy_executor::task]
 async fn sine_wave_gen(
-    mut audio_ep_in: Endpoint<'static, peripherals::USB, In>,
+    mut audio_ep_in: IsoIn<Endpoint<'static, peripherals::USB, In>>,
     control_monitor: ControlMonitor<'static>,
 ) {
     static SILENCE: [u8; SINE_16000HZ_1MS_16BIT_2CH.len()] = [0; SINE_16000HZ_1MS_16BIT_2CH.len()];
@@ -169,7 +169,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(status_led(led).unwrap());
 
     debug!("Run \"sine_wave_gen\" task!");
-    spawner.spawn(sine_wave_gen(audio_ep_in, control_monitor).unwrap());
+    spawner.spawn(sine_wave_gen(IsoIn::new(audio_ep_in), control_monitor).unwrap());
 
     debug!("All tasks were started!");
 }

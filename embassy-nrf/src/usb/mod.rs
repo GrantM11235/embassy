@@ -917,7 +917,6 @@ impl EndpointDir for Out {
 pub struct Endpoint<'d, Dir> {
     regs: pac::usbd::Usbd,
     info: EndpointInfo,
-    schedule: IsoSchedule,
     iso_written_frame: Option<u32>,
     _phantom: PhantomData<(&'d (), Dir)>,
 }
@@ -927,7 +926,6 @@ impl<'d, Dir> Endpoint<'d, Dir> {
         Self {
             regs,
             info,
-            schedule: IsoSchedule::new(),
             iso_written_frame: None,
             _phantom: PhantomData,
         }
@@ -1267,15 +1265,20 @@ impl<'d> driver::EndpointIn for Endpoint<'d, In> {
     }
 }
 
+/// Isochronous IN scheduling state for [`IsoEndpointIn::ready`].
+#[derive(Default)]
+pub struct IsoState(IsoSchedule);
+
 /// Reserved isochronous IN slot returned by [`IsoEndpointIn::ready`].
 pub struct IsoSlot<'a, 'd> {
     ep: &'a mut Endpoint<'d, In>,
+    state: &'a mut IsoState,
     frame: u32,
 }
 
 impl IsoInSlot for IsoSlot<'_, '_> {
     fn write(self, data: &[u8]) -> Result<(), IsoWriteError> {
-        self.ep.schedule.accept();
+        self.state.0.accept();
         if data.len() > usize::from(self.ep.info.max_packet_size) {
             return Err(IsoWriteError::BufferOverflow);
         }
@@ -1304,12 +1307,16 @@ impl IsoInSlot for IsoSlot<'_, '_> {
 }
 
 impl<'d> IsoEndpointIn for Endpoint<'d, In> {
+    type State = IsoState;
     type Slot<'a>
         = IsoSlot<'a, 'd>
     where
         Self: 'a;
 
-    async fn ready(&mut self) -> Result<(Option<NonZeroU32>, Self::Slot<'_>), EndpointDisabledError> {
+    async fn ready<'a>(
+        &'a mut self,
+        state: &'a mut IsoState,
+    ) -> Result<(Option<NonZeroU32>, Self::Slot<'a>), EndpointDisabledError> {
         assert_eq!(
             self.info.ep_type,
             EndpointType::Isochronous,
@@ -1328,7 +1335,7 @@ impl<'d> IsoEndpointIn for Endpoint<'d, In> {
             r
         });
         if reset {
-            self.schedule.reset();
+            state.0.reset();
             self.iso_written_frame = None;
         }
 
@@ -1355,7 +1362,7 @@ impl<'d> IsoEndpointIn for Endpoint<'d, In> {
 
         let mut current = now;
         loop {
-            let offer = self.schedule.offer(current, interval, ISO_FRAME_SPAN);
+            let offer = state.0.offer(current, interval, ISO_FRAME_SPAN);
             let skipped = offer.skipped;
             let frame = offer.frame;
 
@@ -1380,7 +1387,7 @@ impl<'d> IsoEndpointIn for Endpoint<'d, In> {
             .await?;
 
             if ready {
-                return Ok((skipped, IsoSlot { ep: self, frame }));
+                return Ok((skipped, IsoSlot { ep: self, state, frame }));
             }
 
             current = u32::from(self.regs.framecntr().read().framecntr());

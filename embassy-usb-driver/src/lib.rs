@@ -8,7 +8,7 @@ mod interval;
 pub mod iso;
 
 pub use interval::EndpointInterval;
-pub use iso::{IsoEndpointIn, IsoInSlot, IsoWriteError};
+pub use iso::{IsoEndpointIn, IsoIn, IsoInSlot, IsoWriteError};
 
 /// Speed of a device or port
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]

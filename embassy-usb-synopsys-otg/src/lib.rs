@@ -857,7 +857,6 @@ where
                 max_packet_size,
                 interval,
             ),
-            schedule: IsoSchedule::new(),
         })
     }
 }
@@ -1929,8 +1928,6 @@ where
     /// Every endpoint of this device, so a finished arm-wait can see if another is still waiting.
     endpoints: &'d [EpState],
     mutex: M,
-    /// Next isochronous IN slot.
-    schedule: IsoSchedule,
 }
 
 impl<'d, M> embassy_usb_driver::Endpoint for Endpoint<'d, In, M>
@@ -2395,12 +2392,17 @@ where
     }
 }
 
+/// Isochronous IN scheduling state for [`IsoEndpointIn::ready`].
+#[derive(Default)]
+pub struct IsoState(IsoSchedule);
+
 /// Reserved isochronous IN slot returned by [`IsoEndpointIn::ready`].
 pub struct IsoSlot<'a, 'd, M = CriticalSectionRawMutex>
 where
     M: SharedRawMutex,
 {
     ep: &'a mut Endpoint<'d, In, M>,
+    state: &'a mut IsoState,
     frame: u32,
 }
 
@@ -2409,7 +2411,7 @@ where
     M: SharedRawMutex,
 {
     fn write(self, data: &[u8]) -> Result<(), IsoWriteError> {
-        self.ep.schedule.accept();
+        self.state.0.accept();
         if data.len() > usize::from(self.ep.info.max_packet_size) {
             return Err(IsoWriteError::BufferOverflow);
         }
@@ -2453,12 +2455,16 @@ impl<'d, M> IsoEndpointIn for Endpoint<'d, In, M>
 where
     M: SharedRawMutex,
 {
+    type State = IsoState;
     type Slot<'a>
         = IsoSlot<'a, 'd, M>
     where
         Self: 'a;
 
-    async fn ready(&mut self) -> Result<(Option<NonZeroU32>, Self::Slot<'_>), EndpointDisabledError> {
+    async fn ready<'a>(
+        &'a mut self,
+        schedule: &'a mut IsoState,
+    ) -> Result<(Option<NonZeroU32>, Self::Slot<'a>), EndpointDisabledError> {
         assert_eq!(
             self.info.ep_type,
             EndpointType::Isochronous,
@@ -2484,21 +2490,21 @@ where
             r
         });
         if reset {
-            self.schedule.reset();
+            schedule.0.reset();
         }
 
         let span = self.frame_span();
         let interval = self.service_interval();
         let phase = self.state.iso_phase.load(Ordering::Acquire);
         if phase != ISO_PHASE_UNLOCKED {
-            self.schedule.lock_phase(u32::from(phase), interval);
+            schedule.0.lock_phase(u32::from(phase), interval);
         }
 
         loop {
             if !self.state.in_enabled.load(Ordering::Acquire) {
                 return Err(EndpointDisabledError);
             }
-            let offer = self.schedule.offer(self.fnsof(), interval, span);
+            let offer = schedule.0.offer(self.fnsof(), interval, span);
             let skipped = offer.skipped;
             // The even/odd bit can only name the next tick, so wait until `offer.frame` is that tick.
             if self.wait_until_arm_point(offer.frame, interval, span).await? {
@@ -2506,6 +2512,7 @@ where
                     skipped,
                     IsoSlot {
                         ep: self,
+                        state: schedule,
                         frame: offer.frame,
                     },
                 ));

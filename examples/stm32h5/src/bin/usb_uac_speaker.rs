@@ -15,9 +15,7 @@ use embassy_sync::signal::Signal;
 use embassy_sync::zerocopy_channel;
 use embassy_usb::class::uac::device as uac1;
 use embassy_usb::class::uac::device::speaker::{self, FeatureUnitControls, Speaker};
-use embassy_usb::driver::{
-    Endpoint as _, EndpointError, EndpointOut as _, IsoEndpointIn, IsoInSlot as _, IsoWriteError,
-};
+use embassy_usb::driver::{Endpoint as _, EndpointError, EndpointOut as _, IsoIn, IsoInSlot as _, IsoWriteError};
 use heapless::Vec;
 use micromath::F32Ext;
 use panic_probe as _;
@@ -79,7 +77,7 @@ impl From<EndpointError> for Disconnected {
 
 /// Sends feedback messages to the host.
 async fn feedback_handler<'d, T: usb::Instance + 'd>(
-    feedback: &mut Endpoint<'d, T, In>,
+    feedback: &mut IsoIn<Endpoint<'d, T, In>>,
     feedback_factor: f32,
 ) -> Result<(), Disconnected> {
     let mut packet: Vec<u8, 4> = Vec::new();
@@ -180,7 +178,7 @@ async fn usb_streaming_task(
 /// This is achieved by having `TICKS_PER_SAMPLE` be a power of two. For audio applications at a sample rate of 48 kHz,
 /// 24.576 MHz would be one such option.
 #[embassy_executor::task]
-async fn usb_feedback_task(mut feedback: Endpoint<'static, peripherals::USB, In>) {
+async fn usb_feedback_task(mut feedback: IsoIn<Endpoint<'static, peripherals::USB, In>>) {
     let feedback_factor =
         ((1 << FEEDBACK_SHIFT) as f32 / TICKS_PER_SAMPLE) / FEEDBACK_REFRESH_PERIOD.frame_count() as f32;
 
@@ -396,7 +394,7 @@ async fn main(spawner: Spawner) {
     // Launch USB audio tasks.
     spawner.spawn(unwrap!(usb_control_task(control_monitor)));
     spawner.spawn(unwrap!(usb_streaming_task(stream, sender)));
-    spawner.spawn(unwrap!(usb_feedback_task(feedback)));
+    spawner.spawn(unwrap!(usb_feedback_task(IsoIn::new(feedback))));
     spawner.spawn(unwrap!(usb_task(usb_device)));
     spawner.spawn(unwrap!(audio_receiver_task(receiver)));
 }

@@ -2,7 +2,7 @@
 
 use core::num::NonZeroU32;
 
-use crate::{Endpoint, EndpointDisabledError};
+use crate::{Endpoint, EndpointDisabledError, EndpointInfo};
 
 /// Why [`IsoInSlot::write`] did not queue the transfer.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -60,7 +60,12 @@ pub trait IsoInSlot {
 /// Drivers implement this only when they can schedule transfers by service interval and drop
 /// uncollected transfers instead of sending them late.
 pub trait IsoEndpointIn: Endpoint {
-    /// A reserved slot borrowing this endpoint.
+    /// Scheduling state held by the caller across [`ready`](Self::ready) calls.
+    ///
+    /// Use one per endpoint. The driver resets it when the endpoint is disabled.
+    type State: Default;
+
+    /// A reserved slot borrowing this endpoint and its state.
     type Slot<'a>: IsoInSlot
     where
         Self: 'a;
@@ -107,11 +112,12 @@ pub trait IsoEndpointIn: Endpoint {
     ///
     /// ```no_run
     /// # use embassy_usb_driver::*;
-    /// async fn example(mut ep: impl IsoEndpointIn, mut get_packet: impl FnMut() -> [u8; 8]) {
+    /// async fn example<E: IsoEndpointIn>(mut ep: E, mut get_packet: impl FnMut() -> [u8; 8]) {
     ///     assert!(ep.info().max_packet_size >= 8);
     ///     ep.wait_enabled().await;
+    ///     let mut state = E::State::default();
     ///     loop {
-    ///         let Ok((skipped, slot)) = ep.ready().await else {
+    ///         let Ok((skipped, slot)) = ep.ready(&mut state).await else {
     ///             break;
     ///         };
     ///         if let Some(skipped) = skipped {
@@ -134,5 +140,51 @@ pub trait IsoEndpointIn: Endpoint {
     ///     }
     /// }
     /// ```
-    async fn ready(&mut self) -> Result<(Option<NonZeroU32>, Self::Slot<'_>), EndpointDisabledError>;
+    async fn ready<'a>(
+        &'a mut self,
+        state: &'a mut Self::State,
+    ) -> Result<(Option<NonZeroU32>, Self::Slot<'a>), EndpointDisabledError>;
+}
+
+/// An isochronous IN endpoint with its scheduling state.
+pub struct IsoIn<E: IsoEndpointIn> {
+    ep: E,
+    state: E::State,
+}
+
+impl<E: IsoEndpointIn> IsoIn<E> {
+    /// Wrap `ep` with fresh scheduling state.
+    pub fn new(ep: E) -> Self {
+        Self {
+            ep,
+            state: E::State::default(),
+        }
+    }
+
+    /// Get the endpoint information.
+    pub fn info(&self) -> EndpointInfo {
+        self.ep.info()
+    }
+
+    /// Wait for the endpoint to be enabled.
+    pub async fn wait_enabled(&mut self) {
+        self.ep.wait_enabled().await
+    }
+
+    /// Whether the endpoint is enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.ep.is_enabled()
+    }
+
+    /// Wait until the next transfer can be queued.
+    ///
+    /// See [`IsoEndpointIn::ready`].
+    pub async fn ready(&mut self) -> Result<(Option<NonZeroU32>, E::Slot<'_>), EndpointDisabledError> {
+        self.ep.ready(&mut self.state).await
+    }
+
+    /// Return the endpoint, dropping its state.
+    pub fn into_inner(self) -> E {
+        self.ep
+    }
 }
