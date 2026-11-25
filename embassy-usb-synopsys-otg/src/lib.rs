@@ -2496,15 +2496,13 @@ where
         let span = self.frame_span();
         let interval = self.service_interval();
         let phase = self.state.iso_phase.load(Ordering::Acquire);
-        if phase != ISO_PHASE_UNLOCKED {
-            schedule.0.lock_phase(u32::from(phase), interval);
-        }
+        let phase = (phase != ISO_PHASE_UNLOCKED).then_some(u32::from(phase));
 
         loop {
             if !self.state.in_enabled.load(Ordering::Acquire) {
                 return Err(EndpointDisabledError);
             }
-            let offer = schedule.0.offer(self.fnsof(), interval, span);
+            let offer = schedule.0.offer(self.fnsof(), interval, span, phase);
             let skipped = offer.skipped;
             // The even/odd bit can only name the next tick, so wait until `offer.frame` is that tick.
             if self.wait_until_arm_point(offer.frame, interval, span).await? {

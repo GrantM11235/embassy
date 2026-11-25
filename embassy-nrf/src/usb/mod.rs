@@ -1362,7 +1362,7 @@ impl<'d> IsoEndpointIn for Endpoint<'d, In> {
 
         let mut current = now;
         loop {
-            let offer = state.0.offer(current, interval, ISO_FRAME_SPAN);
+            let offer = state.0.offer(current, interval, ISO_FRAME_SPAN, None);
             let skipped = offer.skipped;
             let frame = offer.frame;
 

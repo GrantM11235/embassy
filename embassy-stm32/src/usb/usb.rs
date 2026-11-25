@@ -2016,20 +2016,18 @@ impl<'d, T: Instance> IsoEndpointIn for Endpoint<'d, T, In> {
         })
         .await?;
 
-        critical_section::with(|cs| {
+        let phase = critical_section::with(|cs| {
             let mut iso = ISO_IN_STATE.borrow(cs).borrow_mut();
             if iso[index].reset {
                 iso[index].reset = false;
                 state.0.reset();
             }
-            if let Some(phase) = iso[index].phase {
-                state.0.lock_phase(u32::from(phase), interval);
-            }
+            iso[index].phase.map(u32::from)
         });
 
         loop {
             let now = u32::from(T::regs().fnr().read().fn_());
-            let offer = state.0.offer(now, interval, ISO_FRAME_SPAN);
+            let offer = state.0.offer(now, interval, ISO_FRAME_SPAN, phase);
             let skipped = offer.skipped;
             let frame = offer.frame;
 
